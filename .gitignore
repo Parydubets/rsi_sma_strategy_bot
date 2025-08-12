@@ -1,0 +1,26 @@
+# created by virtualenv automatically
+*
+# PyCharm
+.idea/
+*.iml
+*.iws
+
+# Python
+__pycache__/
+*.pyc
+*.pyd
+*.pyo
+.Python
+env/
+venv/
+pip-log.txt
+pip-delete-this-arg.txt
+.tox/
+.coverage
+.cache/
+.pytest_cache/
+htmlcov/
+dist/
+build/
+*.egg-info/
+.ipynb_checkpoints/
