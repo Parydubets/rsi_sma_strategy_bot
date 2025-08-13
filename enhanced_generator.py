@@ -335,8 +335,8 @@ class AdvancedSignalGenerator:
                                   idx_primary: int, symbol: str) -> Tuple[
         Optional[str], List[CheckResult], List[CheckResult], List[CheckResult], List[CheckResult], SignalStatus, str]:
         """
-        ОНОВЛЕНА ЛОГІКА: Перевірка сигналів з детальною інформацією про всі перевірки
-        Повертає: direction, primary_passed, primary_failed, confirmation_passed, confirmation_failed, status, skip_reason
+        ВИПРАВЛЕНА ЛОГІКА: Перевірка сигналів з детальною інформацією про всі перевірки
+        ТЕПЕР ВСІ УМОВИ МАЮТЬ БУТИ ВИКОНАНІ ДЛЯ ПІДТВЕРДЖЕННЯ СИГНАЛУ
         """
         if idx_primary < 1:
             return None, [], [], [], [], SignalStatus.SKIP, "Insufficient data"
@@ -370,38 +370,40 @@ class AdvancedSignalGenerator:
             current_primary, previous_primary, symbol
         )
 
-        if long_primary_passed:  # Якщо основні умови виконані
+        # ВИПРАВЛЕНО: перевіряємо що ВСІ умови первинного таймфрейму виконані
+        if len(long_primary_passed) > 0 and len(long_primary_failed) == 0:  # ВСІ умови виконані
             long_confirmation_passed, long_confirmation_failed, skip_reason = self.check_long_conditions_confirmation_detailed(
                 df_confirmation_filtered, current_confirmation
             )
 
-            if long_confirmation_passed and not long_confirmation_failed:  # Якщо підтвердження отримано
+            # ВИПРАВЛЕНО: перевіряємо що ВСІ умови підтвердження виконані
+            if len(long_confirmation_passed) > 0 and len(long_confirmation_failed) == 0:  # ВСІ умови виконані
                 return ("Long", long_primary_passed, long_primary_failed,
                         long_confirmation_passed, long_confirmation_failed, SignalStatus.OPEN, "")
             else:
                 return ("Long", long_primary_passed, long_primary_failed,
-                        long_confirmation_passed, long_confirmation_failed, SignalStatus.SKIP, skip_reason)
+                        long_confirmation_passed, long_confirmation_failed, SignalStatus.SKIP,
+                        skip_reason if skip_reason else "Не всі умови підтвердження виконані")
 
         # === ПЕРЕВІРКА SHORT СИГНАЛУ ===
         short_primary_passed, short_primary_failed = self.check_short_conditions_primary_detailed(
             current_primary, previous_primary, symbol
         )
 
-        if short_primary_passed:  # Якщо основні умови виконані
+        # ВИПРАВЛЕНО: перевіряємо що ВСІ умови первинного таймфрейму виконані
+        if len(short_primary_passed) > 0 and len(short_primary_failed) == 0:  # ВСІ умови виконані
             short_confirmation_passed, short_confirmation_failed, skip_reason = self.check_short_conditions_confirmation_detailed(
                 df_confirmation_filtered, current_confirmation
             )
 
-            if short_confirmation_passed and not short_confirmation_failed:  # Якщо підтвердження отримано
+            # ВИПРАВЛЕНО: перевіряємо що ВСІ умови підтвердження виконані
+            if len(short_confirmation_passed) > 0 and len(short_confirmation_failed) == 0:  # ВСІ умови виконані
                 return ("Short", short_primary_passed, short_primary_failed,
                         short_confirmation_passed, short_confirmation_failed, SignalStatus.OPEN, "")
             else:
                 return ("Short", short_primary_passed, short_primary_failed,
-                        short_confirmation_passed, short_confirmation_failed, SignalStatus.SKIP, skip_reason)
-
-        # Якщо жодних сигналів немає, повертаємо результати всіх перевірок
-        return (None, long_primary_passed + short_primary_passed,
-                long_primary_failed + short_primary_failed, [], [], SignalStatus.SKIP, "No signal conditions met")
+                        short_confirmation_passed, short_confirmation_failed, SignalStatus.SKIP,
+                        skip_reason if skip_reason else "Не всі умови підтвердження виконані")
 
     def check_long_conditions_primary_detailed(self, current_primary: pd.Series, previous_primary: pd.Series,
                                                symbol: str) -> \
@@ -425,7 +427,7 @@ class AdvancedSignalGenerator:
             passed.append(check)
         else:
             failed.append(check)
-            return passed, failed  # Якщо перетину немає, далі не перевіряємо
+            # ВИПРАВЛЕНО: НЕ повертаємо тут, а продовжуємо перевірку всіх умов
 
         # 2. Зглажений RSI < LONG_ENTRY_MAX_RSI
         rsi_in_zone = previous_primary['rsi_sma'] < self.config.LONG_ENTRY_MAX_RSI
@@ -433,7 +435,7 @@ class AdvancedSignalGenerator:
         check = CheckResult(
             name="RSI Entry Zone",
             passed=rsi_in_zone,
-            value=f"RSI={current_primary['rsi_sma']:.2f} < {self.config.LONG_ENTRY_MAX_RSI}",
+            value=f"RSI_SMA={previous_primary['rsi_sma']:.2f} < {self.config.LONG_ENTRY_MAX_RSI}",
             description=f"RSI нижче рівня входу {self.config.LONG_ENTRY_MAX_RSI}"
         )
 
@@ -441,7 +443,7 @@ class AdvancedSignalGenerator:
             passed.append(check)
         else:
             failed.append(check)
-            return passed, failed
+            # ВИПРАВЛЕНО: НЕ повертаємо тут, а продовжуємо перевірку всіх умов
 
         # 3. Делей: остання ПІДТВЕРДЖЕНА LONG позиція закрита мінімум DELAY_CANDLES тому
         delay_ok = self.check_confirmed_position_delay(symbol, "Long", current_primary['datetime'])
@@ -451,63 +453,6 @@ class AdvancedSignalGenerator:
             passed=delay_ok,
             value=f"Delay >= {self.config.DELAY_CANDLES} candles",
             description=f"Мінімум {self.config.DELAY_CANDLES} свічок після останньої підтвердженої Long позиції"
-        )
-
-        if delay_ok:
-            passed.append(check)
-        else:
-            failed.append(check)
-
-        return passed, failed
-
-    def check_short_conditions_primary_detailed(self, current_primary: pd.Series, previous_primary: pd.Series,
-                                                symbol: str) -> \
-            Tuple[List[CheckResult], List[CheckResult]]:
-        """Детальна перевірка умов SHORT на первинному таймфреймі"""
-        passed = []
-        failed = []
-
-        # 1. Зглажений RSI перетинає RSI SMA зверху вниз
-        rsi_cross_down = (previous_primary['rsi'] >= previous_primary['rsi_sma'] and
-                          current_primary['rsi'] < current_primary['rsi_sma'])
-
-        check = CheckResult(
-            name="RSI Cross SMA Down",
-            passed=rsi_cross_down,
-            value=f"Prev: RSI={previous_primary['rsi']:.2f} vs SMA={previous_primary['rsi_sma']:.2f}, Curr: RSI={current_primary['rsi']:.2f} vs SMA={current_primary['rsi_sma']:.2f}",
-            description="RSI перетинає SMA зверху вниз"
-        )
-
-        if rsi_cross_down:
-            passed.append(check)
-        else:
-            failed.append(check)
-            return passed, failed
-
-        # 2. Зглажений RSI > SHORT_ENTRY_MIN_RSI
-        rsi_in_zone = previous_primary['rsi_sma'] > self.config.SHORT_ENTRY_MIN_RSI
-
-        check = CheckResult(
-            name="RSI Entry Zone",
-            passed=rsi_in_zone,
-            value=f"RSI_SMA={current_primary['rsi_sma']:.2f} > {self.config.SHORT_ENTRY_MIN_RSI}",
-            description=f"RSI вище рівня входу {self.config.SHORT_ENTRY_MIN_RSI}"
-        )
-
-        if rsi_in_zone:
-            passed.append(check)
-        else:
-            failed.append(check)
-            return passed, failed
-
-        # 3. Делей: остання ПІДТВЕРДЖЕНА SHORT позиція закрита мінімум DELAY_CANDLES тому
-        delay_ok = self.check_confirmed_position_delay(symbol, "Short", current_primary['datetime'])
-
-        check = CheckResult(
-            name="Position Delay",
-            passed=delay_ok,
-            value=f"Delay >= {self.config.DELAY_CANDLES} candles",
-            description=f"Мінімум {self.config.DELAY_CANDLES} свічок після останньої підтвердженої Short позиції"
         )
 
         if delay_ok:
@@ -541,7 +486,7 @@ class AdvancedSignalGenerator:
         else:
             failed.append(check)
             skip_reason = f"SMA-RSI різниця {rsi_sma_diff:.2f} < {self.config.MIN_DIFF}"
-            return passed, failed, skip_reason
+            # ВИПРАВЛЕНО: НЕ повертаємо тут, а продовжуємо перевірку всіх умов
 
         # 2. Якщо RSI > 50 - сигнал пропускається
         rsi_below_50 = current_confirmation['rsi'] <= 50
@@ -557,8 +502,9 @@ class AdvancedSignalGenerator:
             passed.append(check)
         else:
             failed.append(check)
-            skip_reason = f"RSI {current_confirmation['rsi']:.2f} > 50"
-            return passed, failed, skip_reason
+            if not skip_reason:  # якщо ще не встановлена причина
+                skip_reason = f"RSI {current_confirmation['rsi']:.2f} > 50"
+            # ВИПРАВЛЕНО: НЕ повертаємо тут, а продовжуємо перевірку всіх умов
 
         # 3. Перевірка що SMA НЕ СПАДАЄ (критична для LONG)
         if len(df_confirmation) >= 2:
@@ -571,7 +517,7 @@ class AdvancedSignalGenerator:
             check = CheckResult(
                 name="SMA Not Falling",
                 passed=sma_not_falling,
-                value=f"SMA: {previous_confirmation['rsi_sma']:.2f} → {current_confirmation['rsi_sma']:.2f}",
+                value=f"SMA: {previous_confirmation['rsi_sma']:.2f} -> {current_confirmation['rsi_sma']:.2f}",
                 description="SMA не спадає"
             )
 
@@ -579,8 +525,9 @@ class AdvancedSignalGenerator:
                 passed.append(check)
             else:
                 failed.append(check)
-                skip_reason = "SMA спадає - не підходить для LONG"
-                return passed, failed, skip_reason
+                if not skip_reason:
+                    skip_reason = "SMA спадає - не підходить для LONG"
+                # ВИПРАВЛЕНО: НЕ повертаємо тут, а продовжуємо перевірку всіх умов
 
         # 4. Перевірка тренду SMA за TREND_CANDLES періодів
         if len(df_confirmation) >= self.config.TREND_CANDLES:
@@ -594,8 +541,8 @@ class AdvancedSignalGenerator:
                             df_confirmation) else current_sma
                         recent_sma_changes.append(current_sma - prev_sma)
 
-            no_uptrend = not (recent_sma_changes and all(change > 0 for change in recent_sma_changes))
-
+            no_uptrend = (recent_sma_changes and all(change > 0 for change in recent_sma_changes))
+            no_uptrend = True # Тимчасвоо вимкнуто
             check = CheckResult(
                 name="No SMA Uptrend",
                 passed=no_uptrend,
@@ -607,11 +554,139 @@ class AdvancedSignalGenerator:
                 passed.append(check)
             else:
                 failed.append(check)
-                skip_reason = f"SMA тренд вгору за {self.config.TREND_CANDLES} періодів"
-                return passed, failed, skip_reason
+                if not skip_reason:
+                    skip_reason = f"SMA тренд вгору за {self.config.TREND_CANDLES} періодів"
 
-        # Якщо дійшли сюди - всі умови виконані
+        # Повертаємо результати всіх перевірок
         return passed, failed, skip_reason
+
+    def scan_dual_timeframe_signals(self, df_primary: pd.DataFrame, df_confirmation: pd.DataFrame,
+                                    pair: str, days_back: int) -> List[AdvancedMarketSignal]:
+        """Сканирование сигналов по двухтаймфреймовой стратегии с детальною інформацією"""
+        signals = []
+
+        if len(df_primary) < 50 or len(df_confirmation) < 10:
+            print(
+                f"⚠️ {pair}: Недостатньо даних ({self.config.PRIMARY_TIMEFRAME}: {len(df_primary)}, {self.config.CONFIRMATION_TIMEFRAME}: {len(df_confirmation)})")
+            return signals
+
+        end_time = datetime.now()
+        start_time = end_time - timedelta(days=days_back)
+
+        print(f"🔍 {pair}: Шукаєм сигнали з {start_time.strftime('%Y-%m-%d %H:%M')}")
+
+        # Фильтруем данные по периоду
+        df_primary_period = df_primary[df_primary['datetime'] >= start_time].copy()
+
+        if len(df_primary_period) < 10:
+            print(f"⚠️ {pair}: Недостатньо даних за період")
+            return signals
+
+        print(f"📊 {pair}: Аналізуємо {len(df_primary_period)} свічей {self.config.PRIMARY_TIMEFRAME}")
+
+        # Находим начальный индекс
+        start_idx = df_primary[df_primary['datetime'] >= start_time].index[0] if len(
+            df_primary[df_primary['datetime'] >= start_time]) > 0 else len(df_primary)
+        start_idx = max(20, start_idx)
+
+        for i in range(start_idx, len(df_primary) - 1):
+            current_row = df_primary.iloc[i]
+
+            if current_row['datetime'] < start_time or current_row['datetime'] > end_time:
+                continue
+
+            try:
+                # Проверка сигнала по новой детальной логике с обработкой ошибок
+                signal_result = self.check_advanced_rsi_signal(df_primary, df_confirmation, i, pair)
+
+                # ВИПРАВЛЕНО: Перевіряємо що результат не None і має правильну структуру
+                if signal_result is None or len(signal_result) != 7:
+                    continue
+
+                direction, primary_passed, primary_failed, confirmation_passed, confirmation_failed, status, skip_reason = signal_result
+
+                if not direction:
+                    continue
+
+                # Находим соответствующие данные на таймфрейме подтверждения
+                current_time = current_row['datetime']
+                df_confirmation_filtered = df_confirmation[df_confirmation['datetime'] <= current_time]
+                if len(df_confirmation_filtered) == 0:
+                    continue
+
+                current_confirmation = df_confirmation_filtered.iloc[-1]
+
+                # Расчет уверенности и качества
+                total_passed_checks = len(primary_passed) + len(confirmation_passed)
+                total_failed_checks = len(primary_failed) + len(confirmation_failed)
+
+                base_confidence = 50.0 if status == SignalStatus.SKIP else 70.0
+                confidence = min(95.0, base_confidence + total_passed_checks * 8.0 - total_failed_checks * 2.0)
+
+                if status == SignalStatus.OPEN:
+                    if confidence >= 80 and total_passed_checks >= 5:
+                        quality = SignalQuality.HIGH
+                    elif confidence >= 65 and total_passed_checks >= 3:
+                        quality = SignalQuality.MEDIUM
+                    else:
+                        quality = SignalQuality.LOW
+                else:
+                    quality = SignalQuality.LOW
+
+                # Расчет времени и цены входа
+                entry_time, entry_price = self.calculate_entry_time_and_price_advanced(
+                    df_primary, i, current_row['datetime']
+                )
+
+                # Регистрируем ТОЛЬКО ПОДТВЕРЖДЕННЫЕ позиции для делея
+                if status == SignalStatus.OPEN:
+                    self.register_confirmed_position(pair, direction, current_row['datetime'])
+
+                # Создание сигнала с детальной информацией
+                signal = AdvancedMarketSignal(
+                    pair=pair,
+                    direction=direction,
+                    signal_time=current_row['datetime'],
+                    entry_time=entry_time,
+
+                    # RSI данные основного таймфрейма
+                    rsi_1m=current_row.get('rsi', 0),
+                    rsi_sma_1m=current_row.get('rsi_sma', 0),
+                    rsi_diff_1m=current_row.get('rsi_diff', 0),
+
+                    # RSI данные таймфрейма подтверждения
+                    rsi_5m=current_confirmation.get('rsi', 0),
+                    rsi_sma_5m=current_confirmation.get('rsi_sma', 0),
+                    rsi_diff_5m=current_confirmation.get('rsi_diff', 0),
+                    avg_diff_5m=current_confirmation.get('avg_diff', 0),
+
+                    signal_price=current_row['close'],
+                    entry_price=entry_price,
+                    quality=quality,
+                    confidence_score=confidence,
+                    status=status,
+
+                    # Детальна інформація про перевірки
+                    primary_checks_passed=primary_passed,
+                    primary_checks_failed=primary_failed,
+                    confirmation_checks_passed=confirmation_passed,
+                    confirmation_checks_failed=confirmation_failed,
+
+                    skip_reason=skip_reason,
+                    comment=f"{self.config.PRIMARY_TIMEFRAME} cross, {self.config.CONFIRMATION_TIMEFRAME} {'confirmed' if status == SignalStatus.OPEN else 'rejected'}"
+                )
+
+                signals.append(signal)
+
+                # Виводимо детальну інформацію про кожен сигнал
+                self.print_detailed_signal_info(signal)
+
+            except Exception as e:
+                # ВИПРАВЛЕНО: Додаємо обробку помилок для кожної ітерації
+                self.logger.error(f"Помилка обробки свічки {i} для {pair}: {e}")
+                continue
+
+        return signals
 
     def check_short_conditions_confirmation_detailed(self, df_confirmation: pd.DataFrame,
                                                      current_confirmation: pd.Series) -> \
@@ -629,7 +704,7 @@ class AdvancedSignalGenerator:
             name="RSI-SMA Difference",
             passed=diff_ok,
             value=f"RSI-SMA={rsi_sma_diff:.2f} >= {self.config.MIN_DIFF}",
-            description=f"Різниця RSI-SMA достатня для входу"
+            description=f"The RSI-SMA difference isn`t enough for the entry"
         )
 
         if diff_ok:
@@ -637,7 +712,7 @@ class AdvancedSignalGenerator:
         else:
             failed.append(check)
             skip_reason = f"RSI-SMA різниця {rsi_sma_diff:.2f} < {self.config.MIN_DIFF}"
-            return passed, failed, skip_reason
+            # ВИПРАВЛЕНО: НЕ повертаємо тут, а продовжуємо перевірку всіх умов
 
         # 2. RSI > 50
         rsi_above_50 = current_confirmation['rsi'] >= 50
@@ -653,14 +728,14 @@ class AdvancedSignalGenerator:
             passed.append(check)
         else:
             failed.append(check)
-            skip_reason = f"RSI {current_confirmation['rsi']:.2f} < 50"
-            return passed, failed, skip_reason
+            if not skip_reason:
+                skip_reason = f"RSI {current_confirmation['rsi']:.2f} < 50"
+            # ВИПРАВЛЕНО: НЕ повертаємо тут, а продовжуємо перевірку всіх умов
 
         # 3. Перевірка що SMA НЕ ЗРОСТАЄ (критична для SHORT)
         if len(df_confirmation) >= 2:
             previous_confirmation = df_confirmation.iloc[-2]
             sma_not_increasing = current_confirmation['rsi_sma'] <= previous_confirmation['rsi_sma']
-
 
             # Тимчасове вимкнення фільтра
             sma_not_increasing = True
@@ -668,7 +743,7 @@ class AdvancedSignalGenerator:
             check = CheckResult(
                 name="SMA Not Increasing",
                 passed=sma_not_increasing,
-                value=f"SMA: {previous_confirmation['rsi_sma']:.2f} → {current_confirmation['rsi_sma']:.2f}",
+                value=f"SMA: {previous_confirmation['rsi_sma']:.2f} -> {current_confirmation['rsi_sma']:.2f}",
                 description="SMA не зростає"
             )
 
@@ -676,8 +751,9 @@ class AdvancedSignalGenerator:
                 passed.append(check)
             else:
                 failed.append(check)
-                skip_reason = "SMA зростає - не підходить для SHORT"
-                return passed, failed, skip_reason
+                if not skip_reason:
+                    skip_reason = "SMA зростає - не підходить для SHORT"
+                # ВИПРАВЛЕНО: НЕ повертаємо тут, а продовжуємо перевірку всіх умов
 
         # 4. Перевірка тренду SMA за TREND_CANDLES періодів
         if len(df_confirmation) >= self.config.TREND_CANDLES:
@@ -691,8 +767,9 @@ class AdvancedSignalGenerator:
                             df_confirmation) else current_sma
                         recent_sma_changes.append(current_sma - prev_sma)
 
-            no_downtrend = not (recent_sma_changes and all(change < 0 for change in recent_sma_changes))
+            no_downtrend =  (recent_sma_changes and all(change < 0 for change in recent_sma_changes))
 
+            no_downtrend = True # Тимчасово вимкнуто
             check = CheckResult(
                 name="No SMA Downtrend",
                 passed=no_downtrend,
@@ -704,11 +781,68 @@ class AdvancedSignalGenerator:
                 passed.append(check)
             else:
                 failed.append(check)
-                skip_reason = f"SMA тренд вниз за {self.config.TREND_CANDLES} періодів"
-                return passed, failed, skip_reason
+                if not skip_reason:
+                    skip_reason = f"SMA тренд вниз за {self.config.TREND_CANDLES} періодів"
 
-        # Якщо дійшли сюди - всі умови виконані
+        # Повертаємо результати всіх перевірок
         return passed, failed, skip_reason
+
+    def check_short_conditions_primary_detailed(self, current_primary: pd.Series, previous_primary: pd.Series,
+                                                symbol: str) -> \
+            Tuple[List[CheckResult], List[CheckResult]]:
+        """Детальна перевірка умов SHORT на первинному таймфреймі"""
+        passed = []
+        failed = []
+
+        # 1. Зглажений RSI перетинає RSI SMA зверху вниз
+        rsi_cross_down = (previous_primary['rsi'] >= previous_primary['rsi_sma'] and
+                          current_primary['rsi'] < current_primary['rsi_sma'])
+
+        check = CheckResult(
+            name="RSI Cross SMA Down",
+            passed=rsi_cross_down,
+            value=f"Prev: RSI={previous_primary['rsi']:.2f} vs SMA={previous_primary['rsi_sma']:.2f}, Curr: RSI={current_primary['rsi']:.2f} vs SMA={current_primary['rsi_sma']:.2f}",
+            description="RSI перетинає SMA зверху вниз"
+        )
+
+        if rsi_cross_down:
+            passed.append(check)
+        else:
+            failed.append(check)
+            # ВИПРАВЛЕНО: НЕ повертаємо тут, а продовжуємо перевірку всіх умов
+
+        # 2. Зглажений RSI > SHORT_ENTRY_MIN_RSI
+        rsi_in_zone = previous_primary['rsi_sma'] > self.config.SHORT_ENTRY_MIN_RSI
+
+        check = CheckResult(
+            name="RSI Entry Zone",
+            passed=rsi_in_zone,
+            value=f"RSI_SMA={previous_primary['rsi_sma']:.2f} > {self.config.SHORT_ENTRY_MIN_RSI}",
+            description=f"RSI вище рівня входу {self.config.SHORT_ENTRY_MIN_RSI}"
+        )
+
+        if rsi_in_zone:
+            passed.append(check)
+        else:
+            failed.append(check)
+            # ВИПРАВЛЕНО: НЕ повертаємо тут, а продовжуємо перевірку всіх умов
+
+        # 3. Делей: остання ПІДТВЕРДЖЕНА SHORT позиція закрита мінімум DELAY_CANDLES тому
+        delay_ok = self.check_confirmed_position_delay(symbol, "Short", current_primary['datetime'])
+
+        check = CheckResult(
+            name="Position Delay",
+            passed=delay_ok,
+            value=f"Delay >= {self.config.DELAY_CANDLES} candles",
+            description=f"Мінімум {self.config.DELAY_CANDLES} свічок після останньої підтвердженої Short позиції"
+        )
+
+        if delay_ok:
+            passed.append(check)
+        else:
+            failed.append(check)
+
+        return passed, failed
 
     def check_confirmed_position_delay(self, symbol: str, direction: str, current_time: datetime) -> bool:
         """Перевірка делею між ПІДТВЕРДЖЕНИМИ позиціями"""
@@ -838,122 +972,6 @@ class AdvancedSignalGenerator:
         print(
             f"      {self.config.CONFIRMATION_TIMEFRAME}: RSI={signal.rsi_5m:.2f}, SMA={signal.rsi_sma_5m:.2f}, Diff={signal.rsi_diff_5m:.2f}")
 
-    def scan_dual_timeframe_signals(self, df_primary: pd.DataFrame, df_confirmation: pd.DataFrame,
-                                    pair: str, days_back: int) -> List[AdvancedMarketSignal]:
-        """Сканирование сигналов по двухтаймфреймовой стратегии с детальною інформацією"""
-        signals = []
-
-        if len(df_primary) < 50 or len(df_confirmation) < 10:
-            print(
-                f"⚠️ {pair}: Недостатньо даних ({self.config.PRIMARY_TIMEFRAME}: {len(df_primary)}, {self.config.CONFIRMATION_TIMEFRAME}: {len(df_confirmation)})")
-            return signals
-
-        end_time = datetime.now()
-        start_time = end_time - timedelta(days=days_back)
-
-        print(f"🔍 {pair}: Шукаєм сигнали з {start_time.strftime('%Y-%m-%d %H:%M')}")
-
-        # Фильтруем данные по периоду
-        df_primary_period = df_primary[df_primary['datetime'] >= start_time].copy()
-
-        if len(df_primary_period) < 10:
-            print(f"⚠️ {pair}: Недостатньо даних за період")
-            return signals
-
-        print(f"📊 {pair}: Аналізуємо {len(df_primary_period)} свічей {self.config.PRIMARY_TIMEFRAME}")
-
-        # Находим начальный индекс
-        start_idx = df_primary[df_primary['datetime'] >= start_time].index[0] if len(
-            df_primary[df_primary['datetime'] >= start_time]) > 0 else len(df_primary)
-        start_idx = max(20, start_idx)
-
-        for i in range(start_idx, len(df_primary) - 1):
-            current_row = df_primary.iloc[i]
-
-            if current_row['datetime'] < start_time or current_row['datetime'] > end_time:
-                continue
-
-            # Проверка сигнала по новой детальной логике
-            direction, primary_passed, primary_failed, confirmation_passed, confirmation_failed, status, skip_reason = \
-                self.check_advanced_rsi_signal(df_primary, df_confirmation, i, pair)
-
-            if not direction:
-                continue
-
-            # Находим соответствующие данные на таймфрейме подтверждения
-            current_time = current_row['datetime']
-            df_confirmation_filtered = df_confirmation[df_confirmation['datetime'] <= current_time]
-            if len(df_confirmation_filtered) == 0:
-                continue
-
-            current_confirmation = df_confirmation_filtered.iloc[-1]
-
-            # Расчет уверенности и качества
-            total_passed_checks = len(primary_passed) + len(confirmation_passed)
-            total_failed_checks = len(primary_failed) + len(confirmation_failed)
-
-            base_confidence = 50.0 if status == SignalStatus.SKIP else 70.0
-            confidence = min(95.0, base_confidence + total_passed_checks * 8.0 - total_failed_checks * 2.0)
-
-            if status == SignalStatus.OPEN:
-                if confidence >= 80 and total_passed_checks >= 5:
-                    quality = SignalQuality.HIGH
-                elif confidence >= 65 and total_passed_checks >= 3:
-                    quality = SignalQuality.MEDIUM
-                else:
-                    quality = SignalQuality.LOW
-            else:
-                quality = SignalQuality.LOW
-
-            # Расчет времени и цены входа
-            entry_time, entry_price = self.calculate_entry_time_and_price_advanced(
-                df_primary, i, current_row['datetime']
-            )
-
-            # Регистрируем ТОЛЬКО ПОДТВЕРЖДЕННЫЕ позиции для делея
-            if status == SignalStatus.OPEN:
-                self.register_confirmed_position(pair, direction, current_row['datetime'])
-
-            # Создание сигнала с детальной информацией
-            signal = AdvancedMarketSignal(
-                pair=pair,
-                direction=direction,
-                signal_time=current_row['datetime'],
-                entry_time=entry_time,
-
-                # RSI данные основного таймфрейма
-                rsi_1m=current_row.get('rsi', 0),
-                rsi_sma_1m=current_row.get('rsi_sma', 0),
-                rsi_diff_1m=current_row.get('rsi_diff', 0),
-
-                # RSI данные таймфрейма подтверждения
-                rsi_5m=current_confirmation.get('rsi', 0),
-                rsi_sma_5m=current_confirmation.get('rsi_sma', 0),
-                rsi_diff_5m=current_confirmation.get('rsi_diff', 0),
-                avg_diff_5m=current_confirmation.get('avg_diff', 0),
-
-                signal_price=current_row['close'],
-                entry_price=entry_price,
-                quality=quality,
-                confidence_score=confidence,
-                status=status,
-
-                # Детальна інформація про перевірки
-                primary_checks_passed=primary_passed,
-                primary_checks_failed=primary_failed,
-                confirmation_checks_passed=confirmation_passed,
-                confirmation_checks_failed=confirmation_failed,
-
-                skip_reason=skip_reason,
-                comment=f"{self.config.PRIMARY_TIMEFRAME} cross, {self.config.CONFIRMATION_TIMEFRAME} {'confirmed' if status == SignalStatus.OPEN else 'rejected'}"
-            )
-
-            signals.append(signal)
-
-            # Виводимо детальну інформацію про кожен сигнал
-            self.print_detailed_signal_info(signal)
-
-        return signals
 
     async def analyze_pair_advanced(self, pair: str, days_back: int = 7) -> List[AdvancedMarketSignal]:
         """Аналіз пари з новою стратегією"""
@@ -1002,7 +1020,7 @@ class AdvancedSignalGenerator:
 
         try:
             with open(filename, 'w', newline='', encoding='utf-8') as file:
-                writer = csv.writer(file)
+                writer = csv.writer(file, delimiter=";")
 
                 # Заголовки
                 headers = [
@@ -1036,15 +1054,15 @@ class AdvancedSignalGenerator:
                         signal.status.value,
                         signal.signal_time.strftime('%Y-%m-%d %H:%M:%S'),
                         signal.entry_time.strftime('%Y-%m-%d %H:%M:%S'),
-                        f"{signal.rsi_1m:.2f}",
-                        f"{signal.rsi_sma_1m:.2f}",
-                        f"{signal.rsi_diff_1m:.2f}",
-                        f"{signal.rsi_5m:.2f}",
-                        f"{signal.rsi_sma_5m:.2f}",
-                        f"{signal.rsi_diff_5m:.2f}",
-                        f"{signal.avg_diff_5m:.2f}",
-                        f"{signal.signal_price:.6f}",
-                        f"{signal.entry_price:.6f}",
+                        f"{str(signal.rsi_1m).replace(".", ",")}",
+                        f"{str(signal.rsi_sma_1m).replace(".", ",")}",
+                        f"{str(signal.rsi_diff_1m).replace(".", ",")}",
+                        f"{str(signal.rsi_5m).replace(".", ",")}",
+                        f"{str(signal.rsi_sma_5m).replace(".", ",")}",
+                        f"{str(signal.rsi_diff_5m).replace(".", ",")}",
+                        f"{str(signal.avg_diff_5m).replace(".", ",")}",
+                        f"{str(signal.signal_price).replace(".", ",")}",
+                        f"{str(signal.entry_price).replace(".", ",")}",
                         signal.quality.value,
                         f"{signal.confidence_score:.1f}%",
                         primary_passed_str,
