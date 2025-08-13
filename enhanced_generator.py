@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """
-Збалансований генератор торгових сигналів з множинними API запитами
-ПОКРАЩЕНО: Автоматичне об'єднання даних за будь-який період + правки по часу відкриття
+Покращений генератор торгових сигналів v2.2
+ОНОВЛЕНА ЛОГІКА:
+- Повна інформація про всі перевірки
+- Делей тільки для підтверджених сигналів
 """
 
 import ccxt
@@ -9,8 +11,8 @@ import pandas as pd
 import asyncio
 import numpy as np
 from datetime import datetime, timedelta
-from ta.momentum import RSIIndicator, StochRSIIndicator
-from ta.trend import SMAIndicator, EMAIndicator, MACD
+from ta.momentum import RSIIndicator
+from ta.trend import SMAIndicator, EMAIndicator
 from ta.volatility import BollingerBands
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
@@ -20,69 +22,44 @@ import csv
 
 
 @dataclass
-class BalancedConfig:
+class AdvancedConfig:
     # Біржа
     EXCHANGE_NAME: str = 'bybit'
 
-    # Торгові пари для моніторингу
+    # Торгові пари
     PAIRS: List[str] = field(default_factory=lambda: [
         'BTC/USDT', 'ETH/USDT', 'SOL/USDT', 'ADA/USDT', 'DOT/USDT',
         'AVAX/USDT', 'LINK/USDT', 'UNI/USDT', 'ATOM/USDT',
         'LTC/USDT', 'BCH/USDT', 'XRP/USDT', 'DOGE/USDT', 'SHIB/USDT'
     ])
 
-    # Таймфрейм
-    TIMEFRAME: str = '5m'
+    # ТАЙМФРЕЙМИ (налаштовувані)
+    PRIMARY_TIMEFRAME: str = '1m'  # Основний для входу
+    CONFIRMATION_TIMEFRAME: str = '5m'  # Підтвердження
 
-    # RSI параметри
+    # ОНОВЛЕНІ ПАРАМЕТРИ СТРАТЕГІЇ
     RSI_PERIOD: int = 14
     RSI_SMA_PERIOD: int = 14
+    MIN_DIFF: float = 2.0
+    TREND_CANDLES: int = 3
+    DELAY_CANDLES: int = 5
+    LONG_ENTRY_MAX_RSI: float = 40.0
+    SHORT_ENTRY_MIN_RSI: float = 60.0
+    OVERBOUGHT_LEVEL: float = 70.0
+    OVERSOLD_LEVEL: float = 30.0
+    PREOVERSOLD_LEVEL: float = 33.0  # НОВИЙ параметр для закриття SHORT
+    PREBOUGHT_LEVEL: float = 67.0  # НОВИЙ параметр для закриття LONG
+    DIFF_SMOOTHING_PERIODS: int = 3
 
-    # Зони для сигналів
-    LONG_ZONE_MAX: float = 40.0
-    SHORT_ZONE_MIN: float = 60.0
-
-    # Екстремальні зони
-    EXTREME_OVERSOLD: float = 15.0
-    EXTREME_OVERBOUGHT: float = 85.0
-
-    # Фільтри
-    USE_TREND_FILTER: bool = False
-    USE_VOLUME_FILTER: bool = False
-    USE_VOLATILITY_FILTER: bool = False
-    USE_STOCH_RSI_FILTER: bool = True
-    USE_MACD_FILTER: bool = True
-    USE_PRICE_ACTION_FILTER: bool = False
-    USE_TIME_FILTER: bool = False
-    USE_DIVERGENCE_FILTER: bool = True
-
-    # Параметри тренд фільтру
-    TREND_EMA_FAST: int = 21
-    TREND_EMA_SLOW: int = 50
-
-    # Параметри об'єму
-    VOLUME_SMA_PERIOD: int = 20
-    MIN_VOLUME_MULTIPLIER: float = 1.1
-
-    # Параметри волатільності
+    # Болінгер бенди (опціонально)
+    USE_BOLLINGER: bool = False
     BOLLINGER_PERIOD: int = 20
     BOLLINGER_STD: float = 2.0
 
-    # Мінімальний інтервал між сигналами
-    MIN_SIGNAL_INTERVAL: int = 30
-
-    # Часові фільтри
-    AVOID_LOW_VOLATILITY_HOURS: List[int] = field(default_factory=lambda: [])
-
-    # Вимоги для сигналу
-    MIN_FILTERS_REQUIRED: int = 1
-
-    # Інтервал оновлення
+    # Інші параметри
     UPDATE_INTERVAL: int = 30
-
-    # Параметри для множинних запитів
-    MAX_CANDLES_PER_REQUEST: int = 700  # Зменшено для надійності (близько 2.5 дні для 5m)
-    OVERLAP_CANDLES: int = 50  # Перекриття між запитами
+    MAX_CANDLES_PER_REQUEST: int = 700
+    OVERLAP_CANDLES: int = 50
 
 
 class SignalQuality(Enum):
@@ -91,106 +68,174 @@ class SignalQuality(Enum):
     LOW = "Low"
 
 
+class SignalStatus(Enum):
+    OPEN = "open"
+    SKIP = "skip"
+    CLOSED = "closed"
+
+
 @dataclass
-class BalancedMarketSignal:
+class CheckResult:
+    """Результат перевірки умови"""
+    name: str
+    passed: bool
+    value: str
+    description: str
+
+
+@dataclass
+class AdvancedMarketSignal:
     pair: str
     direction: str
-    signal_time: datetime  # Час коли виявлено сигнал
-    entry_time: datetime  # НОВИЙ: Час фактичного входу (наступна свічка + 1хв)
-    rsi: float
-    rsi_sma: float
-    signal_price: float  # Ціна на момент сигналу
-    entry_price: float  # НОВИЙ: Ціна входу (open наступної свічки)
+    signal_time: datetime
+    entry_time: datetime
+
+    # RSI дані 1m
+    rsi_1m: float
+    rsi_sma_1m: float
+    rsi_diff_1m: float
+
+    # RSI дані 5m
+    rsi_5m: float
+    rsi_sma_5m: float
+    rsi_diff_5m: float
+    avg_diff_5m: float
+
+    signal_price: float
+    entry_price: float
     quality: SignalQuality
     confidence_score: float
-    filters_passed: List[str]
+    status: SignalStatus
+
+    # Детальна інформація про перевірки
+    primary_checks_passed: List[CheckResult]
+    primary_checks_failed: List[CheckResult]
+    confirmation_checks_passed: List[CheckResult]
+    confirmation_checks_failed: List[CheckResult]
+
+    skip_reason: str = ""
     comment: str = ""
-    stoch_rsi: float = 0.0
-    macd_signal: str = ""
-    trend_direction: str = ""
-    volume_confirmation: bool = False
-    volatility_ok: bool = False
-    price_action_ok: bool = False
+
+    # Історія останніх позицій
+    last_position_delay: int = 0
 
 
-class BalancedSignalGenerator:
-    def __init__(self, config: BalancedConfig):
+class AdvancedSignalGenerator:
+    def __init__(self, config: AdvancedConfig):
         self.config = config
         self.exchange = self._init_exchange()
         self.logger = self._init_logger()
-        self.market_data: Dict[str, pd.DataFrame] = {}
-        self.last_signals: Dict[str, datetime] = {}
+
+        # Дані по таймфреймам
+        self.market_data_1m: Dict[str, pd.DataFrame] = {}
+        self.market_data_5m: Dict[str, pd.DataFrame] = {}
+
+        # Історія позицій для делею - тільки підтверджені сигнали!
+        self.last_confirmed_positions: Dict[str, List[datetime]] = {}
+
+        # Відкладені сигнали для повторної перевірки SMA
+        self.delayed_signals: Dict[str, Tuple[datetime, str, int, pd.Series, pd.Series]] = {}
 
     def _init_exchange(self):
-        """Ініціалізація біржі"""
         return ccxt.bybit({
             'enableRateLimit': True,
             'sandbox': False
         })
 
     def _init_logger(self):
-        """Ініціалізація логера"""
         logging.basicConfig(
             level=logging.INFO,
             format='%(asctime)s - %(levelname)s - %(message)s'
         )
         return logging.getLogger(__name__)
 
-    def calculate_timeframe_minutes(self) -> int:
+    def calculate_timeframe_minutes(self, timeframe: str) -> int:
         """Розрахунок хвилин для таймфрейму"""
         timeframe_minutes = {
             '1m': 1, '5m': 5, '15m': 15, '30m': 30,
             '1h': 60, '4h': 240, '1d': 1440
         }
-        return timeframe_minutes.get(self.config.TIMEFRAME, 5)
+        return timeframe_minutes.get(timeframe, 1)
 
-    def calculate_required_candles(self, days_back: int) -> int:
-        """Розрахунок необхідної кількості свічок"""
-        minutes_per_candle = self.calculate_timeframe_minutes()
-        total_minutes = days_back * 24 * 60
-        needed_candles = total_minutes // minutes_per_candle
-
-        # Додаємо буфер для індикаторів
-        buffer = max(100, self.config.RSI_PERIOD * 3)
-        return needed_candles + buffer
-
-    def calculate_required_requests(self, days_back: int) -> int:
-        """НОВИЙ: Розрахунок кількості необхідних запитів"""
-        required_candles = self.calculate_required_candles(days_back)
-
-        if required_candles <= self.config.MAX_CANDLES_PER_REQUEST:
-            return 1
-
-        # Враховуємо перекриття між запитами
-        effective_candles_per_request = self.config.MAX_CANDLES_PER_REQUEST - self.config.OVERLAP_CANDLES
-        num_requests = (required_candles + effective_candles_per_request - 1) // effective_candles_per_request
-
-        return max(1, num_requests)
-
-    async def fetch_extended_ohlcv(self, symbol: str, days_back: int) -> Optional[pd.DataFrame]:
-        """ПОКРАЩЕНИЙ: Розширене завантаження з автоматичними множинними запитами"""
+    async def fetch_dual_timeframe_data(self, symbol: str, days_back: int) -> Tuple[
+        Optional[pd.DataFrame], Optional[pd.DataFrame]]:
+        """Завантаження даних для двох таймфреймів"""
         try:
-            required_candles = self.calculate_required_candles(days_back)
-            num_requests = self.calculate_required_requests(days_back)
-            minutes_per_candle = self.calculate_timeframe_minutes()
+            print(
+                f"📊 {symbol}: Завантажуємо дані для {self.config.PRIMARY_TIMEFRAME} та {self.config.CONFIRMATION_TIMEFRAME}...")
 
-            print(f"📊 {symbol}: Потрібно {required_candles} свічок за {days_back} днів")
-            print(f"🔄 {symbol}: Буде зроблено {num_requests} запит(ів)")
+            # Завантажуємо дані основного таймфрейму
+            df_primary = await self.fetch_ohlcv_for_timeframe(symbol, self.config.PRIMARY_TIMEFRAME, days_back)
 
-            # Якщо потрібен тільки один запит
-            if num_requests == 1:
-                return await self.fetch_single_ohlcv(symbol, days_back)
+            # Завантажуємо дані таймфрейму підтвердження
+            df_confirmation = await self.fetch_ohlcv_for_timeframe(symbol, self.config.CONFIRMATION_TIMEFRAME,
+                                                                   days_back)
 
-            # Множинні запити
+            if df_primary is None or df_confirmation is None:
+                print(f"❌ {symbol}: Не вдалося завантажити дані для одного з таймфреймів")
+                return None, None
+
+            print(
+                f"✅ {symbol}: {self.config.PRIMARY_TIMEFRAME}={len(df_primary)} свічок, {self.config.CONFIRMATION_TIMEFRAME}={len(df_confirmation)} свічок")
+            return df_primary, df_confirmation
+
+        except Exception as e:
+            self.logger.error(f"Помилка завантаження даних {symbol}: {e}")
+            return None, None
+
+    async def fetch_ohlcv_for_timeframe(self, symbol: str, timeframe: str, days_back: int) -> Optional[pd.DataFrame]:
+        """Загрузка OHLCV для конкретного таймфрейма"""
+        try:
+            minutes_per_candle = self.calculate_timeframe_minutes(timeframe)
+            required_candles = (days_back * 24 * 60) // minutes_per_candle + 100
+
+            # Если нужно больше одного запроса
+            if required_candles > self.config.MAX_CANDLES_PER_REQUEST:
+                return await self.fetch_extended_ohlcv_timeframe(symbol, timeframe, days_back)
+            else:
+                return await self.fetch_single_ohlcv_timeframe(symbol, timeframe, days_back)
+
+        except Exception as e:
+            self.logger.error(f"Помилка завантаження {symbol} {timeframe}: {e}")
+            return None
+
+    async def fetch_single_ohlcv_timeframe(self, symbol: str, timeframe: str, days_back: int) -> Optional[pd.DataFrame]:
+        """Одиничний запит для таймфрейму"""
+        try:
+            since = int((datetime.now() - timedelta(days=days_back + 1)).timestamp() * 1000)
+
+            ohlcv = self.exchange.fetch_ohlcv(
+                symbol, timeframe, since=since,
+                limit=self.config.MAX_CANDLES_PER_REQUEST
+            )
+
+            if ohlcv and len(ohlcv) >= 50:
+                df = pd.DataFrame(ohlcv, columns=["timestamp", "open", "high", "low", "close", "volume"])
+                df["datetime"] = pd.to_datetime(df["timestamp"], unit="ms")
+                df = df.sort_values('datetime').reset_index(drop=True)
+                return df
+
+            return None
+
+        except Exception as e:
+            self.logger.error(f"Помилка одиничиного завантаження {symbol} {timeframe}: {e}")
+            return None
+
+    async def fetch_extended_ohlcv_timeframe(self, symbol: str, timeframe: str, days_back: int) -> Optional[
+        pd.DataFrame]:
+        """Множинні запити для великого періоду"""
+        try:
+            minutes_per_candle = self.calculate_timeframe_minutes(timeframe)
+            required_candles = (days_back * 24 * 60) // minutes_per_candle + 100
+
+            effective_candles_per_request = self.config.MAX_CANDLES_PER_REQUEST - self.config.OVERLAP_CANDLES
+            num_requests = (required_candles + effective_candles_per_request - 1) // effective_candles_per_request
+
             all_data = []
             current_end = datetime.now()
 
-            # Розраховуємо ефективні свічки за запит (з врахуванням перекриття)
-            effective_candles_per_request = self.config.MAX_CANDLES_PER_REQUEST - self.config.OVERLAP_CANDLES
-
             for batch_num in range(num_requests):
                 try:
-                    # Розраховуємо часові межі для цього батча
                     minutes_back = batch_num * effective_candles_per_request * minutes_per_candle
                     batch_end = current_end - timedelta(minutes=minutes_back)
                     batch_start = batch_end - timedelta(
@@ -198,23 +243,15 @@ class BalancedSignalGenerator:
 
                     since = int(batch_start.timestamp() * 1000)
 
-                    print(f"   📥 Батч {batch_num + 1}/{num_requests}: "
-                          f"{batch_start.strftime('%m/%d %H:%M')} - {batch_end.strftime('%m/%d %H:%M')}")
-
-                    # Запит даних
                     ohlcv = self.exchange.fetch_ohlcv(
-                        symbol,
-                        self.config.TIMEFRAME,
-                        since=since,
+                        symbol, timeframe, since=since,
                         limit=self.config.MAX_CANDLES_PER_REQUEST
                     )
 
                     if ohlcv:
-                        # Перетворюємо в DataFrame
                         batch_df = pd.DataFrame(ohlcv, columns=["timestamp", "open", "high", "low", "close", "volume"])
                         batch_df["datetime"] = pd.to_datetime(batch_df["timestamp"], unit="ms")
 
-                        # Фільтруємо за часовим діапазоном
                         batch_df = batch_df[
                             (batch_df['datetime'] >= batch_start) &
                             (batch_df['datetime'] <= batch_end)
@@ -222,831 +259,923 @@ class BalancedSignalGenerator:
 
                         if len(batch_df) > 0:
                             all_data.append(batch_df)
-                            print(f"   ✅ Отримано {len(batch_df)} свічок")
-                        else:
-                            print(f"   ⚠️ Пустий батч після фільтрації")
 
-                    # Затримка між запитами для уникнення rate limit
                     await asyncio.sleep(0.7)
 
                 except Exception as e:
-                    print(f"   ❌ Помилка батчу {batch_num + 1}: {e}")
+                    print(f"   ❌ Помилка батча {batch_num + 1}: {e}")
                     continue
 
             if not all_data:
-                print(f"❌ {symbol}: Не вдалося завантажити жодного батчу")
                 return None
 
-            # Об'єднуємо всі дані
             combined_df = pd.concat(all_data, ignore_index=True)
-
-            # Сортуємо за часом та видаляємо дублікати
             combined_df = combined_df.sort_values('datetime').drop_duplicates('timestamp').reset_index(drop=True)
 
-            # Перевіряємо покриття
-            if len(combined_df) > 0:
-                data_start = combined_df['datetime'].min()
-                data_end = combined_df['datetime'].max()
-                actual_days = (data_end - data_start).days + 1
-
-                print(f"✅ {symbol}: Об'єднано {len(combined_df)} свічок "
-                      f"({actual_days} днів: {data_start.strftime('%m/%d')} - {data_end.strftime('%m/%d')})")
-
-                return combined_df
-            else:
-                print(f"❌ {symbol}: Порожній результат після об'єднання")
-                return None
+            return combined_df
 
         except Exception as e:
-            self.logger.error(f"Критична помилка множинного завантаження {symbol}: {e}")
+            self.logger.error(f"Критична помилка множинного завантаження {symbol} {timeframe}: {e}")
             return None
 
-    async def fetch_single_ohlcv(self, symbol: str, days_back: int) -> Optional[pd.DataFrame]:
-        """Одиночний запит для коротших періодів"""
-        try:
-            required_candles = self.calculate_required_candles(days_back)
-            since = int((datetime.now() - timedelta(days=days_back + 1)).timestamp() * 1000)
-
-            ohlcv = self.exchange.fetch_ohlcv(
-                symbol,
-                self.config.TIMEFRAME,
-                since=since,
-                limit=min(self.config.MAX_CANDLES_PER_REQUEST, required_candles)
-            )
-
-            if ohlcv and len(ohlcv) >= 50:
-                df = pd.DataFrame(ohlcv, columns=["timestamp", "open", "high", "low", "close", "volume"])
-                df["datetime"] = pd.to_datetime(df["timestamp"], unit="ms")
-                df = df.sort_values('datetime').reset_index(drop=True)
-
-                data_start = df['datetime'].min()
-                data_end = df['datetime'].max()
-                data_days = (data_end - data_start).days + 1
-
-                print(f"✅ {symbol}: {len(df)} свічок ({data_days} днів: "
-                      f"{data_start.strftime('%m/%d')} - {data_end.strftime('%m/%d')})")
-                return df
-
-            return None
-
-        except Exception as e:
-            self.logger.error(f"Помилка одиночного завантаження {symbol}: {e}")
-            return None
-
-    def calculate_indicators(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Розрахунок технічних індикаторів"""
+    def calculate_advanced_indicators(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Розрахунок індикаторів для нової стратегії"""
         if len(df) < 50:
-            self.logger.warning(f"Недостатньо даних для індикаторів: {len(df)} рядків")
             return df
 
         df = df.copy()
 
         try:
-            # Основні індикатори
+            # Основні RSI індикатори
             rsi_indicator = RSIIndicator(close=df['close'], window=self.config.RSI_PERIOD)
             df['rsi'] = rsi_indicator.rsi()
+
+            # RSI SMA (зглажений RSI)
             df['rsi_sma'] = df['rsi'].rolling(window=self.config.RSI_SMA_PERIOD).mean()
 
-            # Додаткові індикатори
-            if self.config.USE_STOCH_RSI_FILTER:
-                try:
-                    stoch_rsi = StochRSIIndicator(close=df['close'])
-                    df['stoch_rsi'] = stoch_rsi.stochrsi()
-                except Exception as e:
-                    self.logger.warning(f"Помилка StochRSI: {e}")
-                    df['stoch_rsi'] = 0.5
+            # Різниця RSI - RSI_SMA
+            df['rsi_diff'] = df['rsi'] - df['rsi_sma']
 
-            if self.config.USE_TREND_FILTER:
-                try:
-                    df['ema_fast'] = EMAIndicator(close=df['close'], window=self.config.TREND_EMA_FAST).ema_indicator()
-                    df['ema_slow'] = EMAIndicator(close=df['close'], window=self.config.TREND_EMA_SLOW).ema_indicator()
-                    df['trend'] = np.where(df['ema_fast'] > df['ema_slow'], 'UP', 'DOWN')
-                except Exception as e:
-                    self.logger.warning(f"Помилка тренд індикаторів: {e}")
+            # Середня різниця з DIFF_SMOOTHING_PERIODS
+            df['avg_diff'] = df['rsi_diff'].rolling(window=self.config.DIFF_SMOOTHING_PERIODS).mean()
 
-            if self.config.USE_MACD_FILTER:
-                try:
-                    macd = MACD(close=df['close'])
-                    df['macd'] = macd.macd()
-                    df['macd_signal'] = macd.macd_signal()
-                    df['macd_diff'] = macd.macd_diff()
-                except Exception as e:
-                    self.logger.warning(f"Помилка MACD: {e}")
+            # Напрямок тренду RSI SMA
+            df['rsi_sma_trend'] = df['rsi_sma'].diff()
+            df['rsi_sma_trend_direction'] = np.where(df['rsi_sma_trend'] > 0, 1,
+                                                     np.where(df['rsi_sma_trend'] < 0, -1, 0))
 
-            if self.config.USE_VOLUME_FILTER and 'volume' in df.columns:
-                try:
-                    df['volume_sma'] = df['volume'].rolling(window=self.config.VOLUME_SMA_PERIOD).mean()
-                    df['volume_ratio'] = df['volume'] / df['volume_sma']
-                except Exception as e:
-                    self.logger.warning(f"Помилка об'ємних індикаторів: {e}")
+            # Підрахунок периодів тренду (для TREND_CANDLES перевірки)
+            df['trend_periods_up'] = 0
+            df['trend_periods_down'] = 0
 
-            if self.config.USE_VOLATILITY_FILTER:
-                try:
-                    bb = BollingerBands(close=df['close'], window=self.config.BOLLINGER_PERIOD,
-                                        window_dev=self.config.BOLLINGER_STD)
-                    df['bb_upper'] = bb.bollinger_hband()
-                    df['bb_lower'] = bb.bollinger_lband()
-                    df['bb_middle'] = bb.bollinger_mavg()
-                    df['bb_position'] = (df['close'] - df['bb_lower']) / (df['bb_upper'] - df['bb_lower'])
-                except Exception as e:
-                    self.logger.warning(f"Помилка Bollinger Bands: {e}")
+            for i in range(self.config.TREND_CANDLES, len(df)):
+                # Перевіряєм останні TREND_CANDLES періодів
+                recent_trends = df['rsi_sma_trend_direction'].iloc[i - self.config.TREND_CANDLES + 1:i + 1]
+
+                if all(trend >= 0 for trend in recent_trends):  # Висхідний або нейтральный тренд
+                    df.loc[i, 'trend_periods_up'] = self.config.TREND_CANDLES
+
+                if all(trend <= 0 for trend in recent_trends):  # Нисхідниий чи нейтральный тренд
+                    df.loc[i, 'trend_periods_down'] = self.config.TREND_CANDLES
+
+            # Болінджер бенди (опціонально)
+            if self.config.USE_BOLLINGER:
+                bb = BollingerBands(close=df['close'], window=self.config.BOLLINGER_PERIOD,
+                                    window_dev=self.config.BOLLINGER_STD)
+                df['bb_upper'] = bb.bollinger_hband()
+                df['bb_lower'] = bb.bollinger_lband()
+                df['bb_middle'] = bb.bollinger_mavg()
 
         except Exception as e:
-            self.logger.error(f"Критична помилка розрахунку індикаторів: {e}")
+            self.logger.error(f"Помилка розрахунку індикаторів: {e}")
 
         return df
 
-    def check_basic_rsi_signal(self, df: pd.DataFrame, idx: int) -> Tuple[Optional[str], List[str]]:
-        """Базова перевірка RSI сигналу"""
-        if idx < 1:
-            return None, []
+    def check_advanced_rsi_signal(self, df_primary: pd.DataFrame, df_confirmation: pd.DataFrame,
+                                  idx_primary: int, symbol: str) -> Tuple[
+        Optional[str], List[CheckResult], List[CheckResult], List[CheckResult], List[CheckResult], SignalStatus, str]:
+        """
+        ОНОВЛЕНА ЛОГІКА: Перевірка сигналів з детальною інформацією про всі перевірки
+        Повертає: direction, primary_passed, primary_failed, confirmation_passed, confirmation_failed, status, skip_reason
+        """
+        if idx_primary < 1:
+            return None, [], [], [], [], SignalStatus.SKIP, "Insufficient data"
 
-        current = df.iloc[idx]
-        previous = df.iloc[idx - 1]
+        current_primary = df_primary.iloc[idx_primary]
+        previous_primary = df_primary.iloc[idx_primary - 1]
 
-        required_fields = ['rsi', 'rsi_sma']
-        for field in required_fields:
-            if pd.isna(current[field]) or pd.isna(previous[field]):
-                return None, []
+        # Знаходимо відповідну свічку на таймреймі для підтвердження
+        current_time = current_primary['datetime']
+        df_confirmation_filtered = df_confirmation[df_confirmation['datetime'] <= current_time]
 
-        filters_passed = ["Base RSI"]
+        if len(df_confirmation_filtered) < self.config.TREND_CANDLES + 1:
+            return None, [], [], [], [], SignalStatus.SKIP, "Insufficient confirmation data"
 
-        # LONG сигнал
-        if (previous['rsi'] <= previous['rsi_sma'] and
-                current['rsi'] > current['rsi_sma'] and
-                current['rsi'] <= self.config.LONG_ZONE_MAX and
-                current['rsi'] >= self.config.EXTREME_OVERSOLD):
-            return "Long", filters_passed
+        current_confirmation = df_confirmation_filtered.iloc[-1]
 
-        # SHORT сигнал
-        elif (previous['rsi'] >= previous['rsi_sma'] and
-              current['rsi'] < current['rsi_sma'] and
-              current['rsi'] >= self.config.SHORT_ZONE_MIN and
-              current['rsi'] <= self.config.EXTREME_OVERBOUGHT):
-            return "Short", filters_passed
+        # Перевіряєм наявність необхідних полів
+        required_fields_primary = ['rsi', 'rsi_sma', 'rsi_diff']
+        required_fields_confirmation = ['rsi', 'rsi_sma', 'rsi_diff']
 
-        return None, []
+        for field in required_fields_primary:
+            if pd.isna(current_primary.get(field)) or pd.isna(previous_primary.get(field)):
+                return None, [], [], [], [], SignalStatus.SKIP, f"Missing {field} on primary timeframe"
 
-    def apply_additional_filters(self, df: pd.DataFrame, direction: str, idx: int) -> Tuple[List[str], str]:
-        """Застосування додаткових фільтрів"""
-        filters_passed = []
-        comments = []
+        for field in required_fields_confirmation:
+            if pd.isna(current_confirmation.get(field)):
+                return None, [], [], [], [], SignalStatus.SKIP, f"Missing {field} on confirmation timeframe"
 
-        current = df.iloc[idx]
+        # === ПЕРЕВІРКА LONG СИГНАЛУ ===
+        long_primary_passed, long_primary_failed = self.check_long_conditions_primary_detailed(
+            current_primary, previous_primary, symbol
+        )
 
-        # StochRSI фільтр
-        if self.config.USE_STOCH_RSI_FILTER:
-            stoch_rsi = current.get('stoch_rsi', 0.5)
-            if not pd.isna(stoch_rsi):
-                if direction == 'Long' and stoch_rsi <= 0.3:
-                    filters_passed.append("StochRSI")
-                    comments.append(f"StochRSI oversold ({stoch_rsi:.2f})")
-                elif direction == 'Short' and stoch_rsi >= 0.7:
-                    filters_passed.append("StochRSI")
-                    comments.append(f"StochRSI overbought ({stoch_rsi:.2f})")
-                else:
-                    comments.append(f"StochRSI neutral ({stoch_rsi:.2f})")
+        if long_primary_passed:  # Якщо основні умови виконані
+            long_confirmation_passed, long_confirmation_failed, skip_reason = self.check_long_conditions_confirmation_detailed(
+                df_confirmation_filtered, current_confirmation
+            )
 
-        # MACD фільтр
-        if self.config.USE_MACD_FILTER and idx > 0:
-            macd = current.get('macd', 0)
-            macd_signal = current.get('macd_signal', 0)
-            if not pd.isna(macd) and not pd.isna(macd_signal):
-                if direction == 'Long' and macd >= macd_signal:
-                    filters_passed.append("MACD")
-                    comments.append("MACD bullish")
-                elif direction == 'Short' and macd <= macd_signal:
-                    filters_passed.append("MACD")
-                    comments.append("MACD bearish")
-                else:
-                    comments.append("MACD neutral")
-
-        # Тренд фільтр
-        if self.config.USE_TREND_FILTER:
-            trend = current.get('trend', 'UNKNOWN')
-            if direction == 'Long' and trend == 'UP':
-                filters_passed.append("Trend")
-                comments.append("Uptrend")
-            elif direction == 'Short' and trend == 'DOWN':
-                filters_passed.append("Trend")
-                comments.append("Downtrend")
+            if long_confirmation_passed and not long_confirmation_failed:  # Якщо підтвердження отримано
+                return ("Long", long_primary_passed, long_primary_failed,
+                        long_confirmation_passed, long_confirmation_failed, SignalStatus.OPEN, "")
             else:
-                comments.append(f"Trend: {trend}")
+                return ("Long", long_primary_passed, long_primary_failed,
+                        long_confirmation_passed, long_confirmation_failed, SignalStatus.SKIP, skip_reason)
 
-        # Об'ємний фільтр
-        if self.config.USE_VOLUME_FILTER:
-            volume_ratio = current.get('volume_ratio', 1.0)
-            if not pd.isna(volume_ratio) and volume_ratio >= self.config.MIN_VOLUME_MULTIPLIER:
-                filters_passed.append("Volume")
-                comments.append(f"High volume ({volume_ratio:.1f}x)")
+        # === ПЕРЕВІРКА SHORT СИГНАЛУ ===
+        short_primary_passed, short_primary_failed = self.check_short_conditions_primary_detailed(
+            current_primary, previous_primary, symbol
+        )
+
+        if short_primary_passed:  # Якщо основні умови виконані
+            short_confirmation_passed, short_confirmation_failed, skip_reason = self.check_short_conditions_confirmation_detailed(
+                df_confirmation_filtered, current_confirmation
+            )
+
+            if short_confirmation_passed and not short_confirmation_failed:  # Якщо підтвердження отримано
+                return ("Short", short_primary_passed, short_primary_failed,
+                        short_confirmation_passed, short_confirmation_failed, SignalStatus.OPEN, "")
             else:
-                comments.append(f"Volume: {volume_ratio:.1f}x")
+                return ("Short", short_primary_passed, short_primary_failed,
+                        short_confirmation_passed, short_confirmation_failed, SignalStatus.SKIP, skip_reason)
 
-        # Волатільність фільтр
-        if self.config.USE_VOLATILITY_FILTER:
-            bb_position = current.get('bb_position', 0.5)
-            if not pd.isna(bb_position):
-                if direction == 'Long' and bb_position <= 0.3:
-                    filters_passed.append("Volatility")
-                    comments.append(f"BB oversold ({bb_position:.2f})")
-                elif direction == 'Short' and bb_position >= 0.7:
-                    filters_passed.append("Volatility")
-                    comments.append(f"BB overbought ({bb_position:.2f})")
-                else:
-                    comments.append(f"BB position: {bb_position:.2f}")
+        # Якщо жодних сигналів немає, повертаємо результати всіх перевірок
+        return (None, long_primary_passed + short_primary_passed,
+                long_primary_failed + short_primary_failed, [], [], SignalStatus.SKIP, "No signal conditions met")
 
-        # Дивергенція фільтр
-        if self.config.USE_DIVERGENCE_FILTER and idx >= 5:
-            filters_passed.append("Divergence")
-            comments.append("Divergence OK")
+    def check_long_conditions_primary_detailed(self, current_primary: pd.Series, previous_primary: pd.Series,
+                                               symbol: str) -> \
+            Tuple[List[CheckResult], List[CheckResult]]:
+        """Детальна перевірка умов LONG на первинному таймфреймі"""
+        passed = []
+        failed = []
 
-        # Часовий фільтр
-        if not self.config.USE_TIME_FILTER or current['datetime'].hour not in self.config.AVOID_LOW_VOLATILITY_HOURS:
-            filters_passed.append("Time")
-            comments.append("Good time")
+        # 1. Зглажений RSI перетинає RSI SMA знизу вверх
+        rsi_cross_up = (previous_primary['rsi'] <= previous_primary['rsi_sma'] and
+                        current_primary['rsi'] > current_primary['rsi_sma'])
 
-        return filters_passed, " | ".join(comments)
+        check = CheckResult(
+            name="RSI Cross SMA Up",
+            passed=rsi_cross_up,
+            value=f"Prev: RSI={previous_primary['rsi']:.2f} vs SMA={previous_primary['rsi_sma']:.2f}, Curr: RSI={current_primary['rsi']:.2f} vs SMA={current_primary['rsi_sma']:.2f}",
+            description="RSI перетинає SMA знизу вверх"
+        )
 
-    def calculate_confidence_score(self, base_filters: List[str], additional_filters: List[str],
-                                   rsi: float, direction: str) -> float:
-        """Розрахунок рівня впевненості"""
-        base_score = 50.0
-        base_bonus = len(base_filters) * 10
-        filter_bonus = len(additional_filters) * 5
-
-        if direction == 'Long':
-            if rsi <= 30:
-                rsi_bonus = 15
-            elif rsi <= 35:
-                rsi_bonus = 10
-            else:
-                rsi_bonus = 5
+        if rsi_cross_up:
+            passed.append(check)
         else:
-            if rsi >= 70:
-                rsi_bonus = 15
-            elif rsi >= 65:
-                rsi_bonus = 10
-            else:
-                rsi_bonus = 5
+            failed.append(check)
+            return passed, failed  # Якщо перетину немає, далі не перевіряємо
 
-        confidence = base_score + base_bonus + filter_bonus + rsi_bonus
-        return min(95.0, confidence)
+        # 2. Зглажений RSI < LONG_ENTRY_MAX_RSI
+        rsi_in_zone = previous_primary['rsi_sma'] < self.config.LONG_ENTRY_MAX_RSI
 
-    def determine_signal_quality(self, confidence_score: float, total_filters: int) -> SignalQuality:
-        """Визначення якості сигналу"""
-        if confidence_score >= 80 and total_filters >= 4:
-            return SignalQuality.HIGH
-        elif confidence_score >= 65 and total_filters >= 2:
-            return SignalQuality.MEDIUM
+        check = CheckResult(
+            name="RSI Entry Zone",
+            passed=rsi_in_zone,
+            value=f"RSI={current_primary['rsi_sma']:.2f} < {self.config.LONG_ENTRY_MAX_RSI}",
+            description=f"RSI нижче рівня входу {self.config.LONG_ENTRY_MAX_RSI}"
+        )
+
+        if rsi_in_zone:
+            passed.append(check)
         else:
-            return SignalQuality.LOW
+            failed.append(check)
+            return passed, failed
 
-    def calculate_entry_time_and_price(self, df: pd.DataFrame, signal_idx: int, signal_time: datetime) -> Tuple[
-        datetime, float]:
-        """НОВИЙ: Розрахунок фактичного часу входу і ціни (наступна свічка + 1хв)"""
+        # 3. Делей: остання ПІДТВЕРДЖЕНА LONG позиція закрита мінімум DELAY_CANDLES тому
+        delay_ok = self.check_confirmed_position_delay(symbol, "Long", current_primary['datetime'])
+
+        check = CheckResult(
+            name="Position Delay",
+            passed=delay_ok,
+            value=f"Delay >= {self.config.DELAY_CANDLES} candles",
+            description=f"Мінімум {self.config.DELAY_CANDLES} свічок після останньої підтвердженої Long позиції"
+        )
+
+        if delay_ok:
+            passed.append(check)
+        else:
+            failed.append(check)
+
+        return passed, failed
+
+    def check_short_conditions_primary_detailed(self, current_primary: pd.Series, previous_primary: pd.Series,
+                                                symbol: str) -> \
+            Tuple[List[CheckResult], List[CheckResult]]:
+        """Детальна перевірка умов SHORT на первинному таймфреймі"""
+        passed = []
+        failed = []
+
+        # 1. Зглажений RSI перетинає RSI SMA зверху вниз
+        rsi_cross_down = (previous_primary['rsi'] >= previous_primary['rsi_sma'] and
+                          current_primary['rsi'] < current_primary['rsi_sma'])
+
+        check = CheckResult(
+            name="RSI Cross SMA Down",
+            passed=rsi_cross_down,
+            value=f"Prev: RSI={previous_primary['rsi']:.2f} vs SMA={previous_primary['rsi_sma']:.2f}, Curr: RSI={current_primary['rsi']:.2f} vs SMA={current_primary['rsi_sma']:.2f}",
+            description="RSI перетинає SMA зверху вниз"
+        )
+
+        if rsi_cross_down:
+            passed.append(check)
+        else:
+            failed.append(check)
+            return passed, failed
+
+        # 2. Зглажений RSI > SHORT_ENTRY_MIN_RSI
+        rsi_in_zone = previous_primary['rsi_sma'] > self.config.SHORT_ENTRY_MIN_RSI
+
+        check = CheckResult(
+            name="RSI Entry Zone",
+            passed=rsi_in_zone,
+            value=f"RSI_SMA={current_primary['rsi_sma']:.2f} > {self.config.SHORT_ENTRY_MIN_RSI}",
+            description=f"RSI вище рівня входу {self.config.SHORT_ENTRY_MIN_RSI}"
+        )
+
+        if rsi_in_zone:
+            passed.append(check)
+        else:
+            failed.append(check)
+            return passed, failed
+
+        # 3. Делей: остання ПІДТВЕРДЖЕНА SHORT позиція закрита мінімум DELAY_CANDLES тому
+        delay_ok = self.check_confirmed_position_delay(symbol, "Short", current_primary['datetime'])
+
+        check = CheckResult(
+            name="Position Delay",
+            passed=delay_ok,
+            value=f"Delay >= {self.config.DELAY_CANDLES} candles",
+            description=f"Мінімум {self.config.DELAY_CANDLES} свічок після останньої підтвердженої Short позиції"
+        )
+
+        if delay_ok:
+            passed.append(check)
+        else:
+            failed.append(check)
+
+        return passed, failed
+
+    def check_long_conditions_confirmation_detailed(self, df_confirmation: pd.DataFrame,
+                                                    current_confirmation: pd.Series) -> \
+            Tuple[List[CheckResult], List[CheckResult], str]:
+        """Детальна перевірка підтвердження LONG на таймфреймі підтвердження"""
+        passed = []
+        failed = []
+        skip_reason = ""
+
+        # 1. RSI останньої закритої свічки менший за SMA на MIN_DIFF
+        rsi_sma_diff = current_confirmation['rsi_sma'] - current_confirmation['rsi']
+        diff_ok = rsi_sma_diff >= self.config.MIN_DIFF
+
+        check = CheckResult(
+            name="SMA-RSI Difference",
+            passed=diff_ok,
+            value=f"SMA-RSI={rsi_sma_diff:.2f} >= {self.config.MIN_DIFF}",
+            description=f"Різниця SMA-RSI достатня для входу"
+        )
+
+        if diff_ok:
+            passed.append(check)
+        else:
+            failed.append(check)
+            skip_reason = f"SMA-RSI різниця {rsi_sma_diff:.2f} < {self.config.MIN_DIFF}"
+            return passed, failed, skip_reason
+
+        # 2. Якщо RSI > 50 - сигнал пропускається
+        rsi_below_50 = current_confirmation['rsi'] <= 50
+
+        check = CheckResult(
+            name="RSI Below 50",
+            passed=rsi_below_50,
+            value=f"RSI={current_confirmation['rsi']:.2f} <= 50",
+            description="RSI нижче нейтрального рівня 50"
+        )
+
+        if rsi_below_50:
+            passed.append(check)
+        else:
+            failed.append(check)
+            skip_reason = f"RSI {current_confirmation['rsi']:.2f} > 50"
+            return passed, failed, skip_reason
+
+        # 3. Перевірка що SMA НЕ СПАДАЄ (критична для LONG)
+        if len(df_confirmation) >= 2:
+            previous_confirmation = df_confirmation.iloc[-2]
+            sma_not_falling = current_confirmation['rsi_sma'] >= previous_confirmation['rsi_sma']
+
+            # Тимчасове вимкнення фільтра
+            sma_not_falling = True
+
+            check = CheckResult(
+                name="SMA Not Falling",
+                passed=sma_not_falling,
+                value=f"SMA: {previous_confirmation['rsi_sma']:.2f} → {current_confirmation['rsi_sma']:.2f}",
+                description="SMA не спадає"
+            )
+
+            if sma_not_falling:
+                passed.append(check)
+            else:
+                failed.append(check)
+                skip_reason = "SMA спадає - не підходить для LONG"
+                return passed, failed, skip_reason
+
+        # 4. Перевірка тренду SMA за TREND_CANDLES періодів
+        if len(df_confirmation) >= self.config.TREND_CANDLES:
+            recent_sma_changes = []
+            for i in range(self.config.TREND_CANDLES):
+                idx = -(i + 1)
+                if abs(idx) <= len(df_confirmation):
+                    if abs(idx) < len(df_confirmation):
+                        current_sma = df_confirmation.iloc[idx]['rsi_sma']
+                        prev_sma = df_confirmation.iloc[idx - 1]['rsi_sma'] if abs(idx - 1) <= len(
+                            df_confirmation) else current_sma
+                        recent_sma_changes.append(current_sma - prev_sma)
+
+            no_uptrend = not (recent_sma_changes and all(change > 0 for change in recent_sma_changes))
+
+            check = CheckResult(
+                name="No SMA Uptrend",
+                passed=no_uptrend,
+                value=f"SMA changes: {[f'{change:.3f}' for change in recent_sma_changes]}",
+                description=f"Немає стійкого SMA тренду вгору за {self.config.TREND_CANDLES} періодів"
+            )
+
+            if no_uptrend:
+                passed.append(check)
+            else:
+                failed.append(check)
+                skip_reason = f"SMA тренд вгору за {self.config.TREND_CANDLES} періодів"
+                return passed, failed, skip_reason
+
+        # Якщо дійшли сюди - всі умови виконані
+        return passed, failed, skip_reason
+
+    def check_short_conditions_confirmation_detailed(self, df_confirmation: pd.DataFrame,
+                                                     current_confirmation: pd.Series) -> \
+            Tuple[List[CheckResult], List[CheckResult], str]:
+        """Детальна перевірка підтвердження SHORT на таймфреймі підтвердження"""
+        passed = []
+        failed = []
+        skip_reason = ""
+
+        # 1. RSI останньої закритої свічки більший за SMA на MIN_DIFF
+        rsi_sma_diff = current_confirmation['rsi'] - current_confirmation['rsi_sma']
+        diff_ok = rsi_sma_diff >= self.config.MIN_DIFF
+
+        check = CheckResult(
+            name="RSI-SMA Difference",
+            passed=diff_ok,
+            value=f"RSI-SMA={rsi_sma_diff:.2f} >= {self.config.MIN_DIFF}",
+            description=f"Різниця RSI-SMA достатня для входу"
+        )
+
+        if diff_ok:
+            passed.append(check)
+        else:
+            failed.append(check)
+            skip_reason = f"RSI-SMA різниця {rsi_sma_diff:.2f} < {self.config.MIN_DIFF}"
+            return passed, failed, skip_reason
+
+        # 2. RSI > 50
+        rsi_above_50 = current_confirmation['rsi'] >= 50
+
+        check = CheckResult(
+            name="RSI Above 50",
+            passed=rsi_above_50,
+            value=f"RSI={current_confirmation['rsi']:.2f} >= 50",
+            description="RSI вище нейтрального рівня 50"
+        )
+
+        if rsi_above_50:
+            passed.append(check)
+        else:
+            failed.append(check)
+            skip_reason = f"RSI {current_confirmation['rsi']:.2f} < 50"
+            return passed, failed, skip_reason
+
+        # 3. Перевірка що SMA НЕ ЗРОСТАЄ (критична для SHORT)
+        if len(df_confirmation) >= 2:
+            previous_confirmation = df_confirmation.iloc[-2]
+            sma_not_increasing = current_confirmation['rsi_sma'] <= previous_confirmation['rsi_sma']
+
+
+            # Тимчасове вимкнення фільтра
+            sma_not_increasing = True
+
+            check = CheckResult(
+                name="SMA Not Increasing",
+                passed=sma_not_increasing,
+                value=f"SMA: {previous_confirmation['rsi_sma']:.2f} → {current_confirmation['rsi_sma']:.2f}",
+                description="SMA не зростає"
+            )
+
+            if sma_not_increasing:
+                passed.append(check)
+            else:
+                failed.append(check)
+                skip_reason = "SMA зростає - не підходить для SHORT"
+                return passed, failed, skip_reason
+
+        # 4. Перевірка тренду SMA за TREND_CANDLES періодів
+        if len(df_confirmation) >= self.config.TREND_CANDLES:
+            recent_sma_changes = []
+            for i in range(self.config.TREND_CANDLES):
+                idx = -(i + 1)
+                if abs(idx) <= len(df_confirmation):
+                    if abs(idx) < len(df_confirmation):
+                        current_sma = df_confirmation.iloc[idx]['rsi_sma']
+                        prev_sma = df_confirmation.iloc[idx - 1]['rsi_sma'] if abs(idx - 1) <= len(
+                            df_confirmation) else current_sma
+                        recent_sma_changes.append(current_sma - prev_sma)
+
+            no_downtrend = not (recent_sma_changes and all(change < 0 for change in recent_sma_changes))
+
+            check = CheckResult(
+                name="No SMA Downtrend",
+                passed=no_downtrend,
+                value=f"SMA changes: {[f'{change:.3f}' for change in recent_sma_changes]}",
+                description=f"Немає стійкого SMA тренду вниз за {self.config.TREND_CANDLES} періодів"
+            )
+
+            if no_downtrend:
+                passed.append(check)
+            else:
+                failed.append(check)
+                skip_reason = f"SMA тренд вниз за {self.config.TREND_CANDLES} періодів"
+                return passed, failed, skip_reason
+
+        # Якщо дійшли сюди - всі умови виконані
+        return passed, failed, skip_reason
+
+    def check_confirmed_position_delay(self, symbol: str, direction: str, current_time: datetime) -> bool:
+        """Перевірка делею між ПІДТВЕРДЖЕНИМИ позиціями"""
+        if symbol not in self.last_confirmed_positions:
+            self.last_confirmed_positions[symbol] = []
+            return True
+
+        # Фільтруємо позиції по напрямку та часу
+        position_key = f"{symbol}_{direction}"
+        recent_positions = [
+            pos_time for pos_time in self.last_confirmed_positions.get(position_key, [])
+            if (current_time - pos_time).total_seconds() / 60 < self.config.DELAY_CANDLES
+        ]
+
+        return len(recent_positions) == 0
+
+    def register_confirmed_position(self, symbol: str, direction: str, position_time: datetime):
+        """Реєстрація нової ПІДТВЕРДЖЕНОЇ позиції для відстеження делею"""
+        position_key = f"{symbol}_{direction}"
+
+        if position_key not in self.last_confirmed_positions:
+            self.last_confirmed_positions[position_key] = []
+
+        self.last_confirmed_positions[position_key].append(position_time)
+
+        # Очищуємо старі позиції (старіші за DELAY_CANDLES * 2)
+        cutoff_time = position_time - timedelta(minutes=self.config.DELAY_CANDLES * 2)
+        self.last_confirmed_positions[position_key] = [
+            pos_time for pos_time in self.last_confirmed_positions[position_key]
+            if pos_time > cutoff_time
+        ]
+
+    def check_exit_conditions(self, df_confirmation: pd.DataFrame, direction: str, current_confirmation: pd.Series) -> \
+            Tuple[bool, str]:
+        """Перевірка умов закриття позиції"""
+        if direction == "Long":
+            # Закриття за умови досягнення RSI зони PREBOUGHT_LEVEL на таймфреймі підтвердження
+            if current_confirmation['rsi'] >= self.config.PREBOUGHT_LEVEL:
+                return True, f"RSI >= {self.config.PREBOUGHT_LEVEL}"
+
+            # Закриття за умови перетину rsi sma вниз на таймфреймі підтвердження
+            if len(df_confirmation) >= 2:
+                previous_confirmation = df_confirmation.iloc[-2]
+                if (previous_confirmation['rsi'] >= previous_confirmation['rsi_sma'] and
+                        current_confirmation['rsi'] < current_confirmation['rsi_sma']):
+                    return True, "RSI перетнув SMA вниз"
+
+        elif direction == "Short":
+            # Закриття за умови досягнення RSI зони PREOVERSOLD_LEVEL на таймфреймі підтвердження
+            if current_confirmation['rsi'] <= self.config.PREOVERSOLD_LEVEL:
+                return True, f"RSI <= {self.config.PREOVERSOLD_LEVEL}"
+
+            # Закриття за умови перетину rsi sma вгору на таймфреймі підтвердження
+            if len(df_confirmation) >= 2:
+                previous_confirmation = df_confirmation.iloc[-2]
+                if (previous_confirmation['rsi'] <= previous_confirmation['rsi_sma'] and
+                        current_confirmation['rsi'] > current_confirmation['rsi_sma']):
+                    return True, "RSI перетнув SMA вгору"
+
+        return False, ""
+
+    def calculate_entry_time_and_price_advanced(self, df_primary: pd.DataFrame, signal_idx: int,
+                                                signal_time: datetime) -> Tuple[datetime, float]:
+        """Розрахунок часу та ціни входу для нової стратегії"""
         try:
-            # Шукаємо наступну свічку після сигналу
-            if signal_idx + 1 < len(df):
-                next_candle = df.iloc[signal_idx + 1]
-
-                # Час входу = час наступної свічки + 1 хвилина
-                entry_time = next_candle['datetime'] + timedelta(minutes=1)
-                entry_price = next_candle['open']  # Ціна відкриття наступної свічки
-
+            if signal_idx + 1 < len(df_primary):
+                next_candle = df_primary.iloc[signal_idx + 1]
+                primary_minutes = self.calculate_timeframe_minutes(self.config.PRIMARY_TIMEFRAME)
+                entry_time = next_candle['datetime'] + timedelta(minutes=primary_minutes)
+                entry_price = next_candle['open']
                 return entry_time, entry_price
             else:
-                # Якщо наступної свічки немає, використовуємо приблизний розрахунок
-                timeframe_minutes = self.calculate_timeframe_minutes()
-                entry_time = signal_time + timedelta(minutes=timeframe_minutes + 1)
-                entry_price = df.iloc[signal_idx]['close']  # Використовуємо ціну закриття поточної свічки
-
+                primary_minutes = self.calculate_timeframe_minutes(self.config.PRIMARY_TIMEFRAME)
+                entry_time = signal_time + timedelta(minutes=primary_minutes * 2)
+                entry_price = df_primary.iloc[signal_idx]['close']
                 return entry_time, entry_price
 
-        except Exception as e:
-            # Fallback: просто додаємо таймфрейм + 1 хвилину
-            timeframe_minutes = self.calculate_timeframe_minutes()
-            entry_time = signal_time + timedelta(minutes=timeframe_minutes + 1)
-            entry_price = df.iloc[signal_idx]['close']
-
+        except Exception:
+            primary_minutes = self.calculate_timeframe_minutes(self.config.PRIMARY_TIMEFRAME)
+            entry_time = signal_time + timedelta(minutes=primary_minutes * 2)
+            entry_price = df_primary.iloc[signal_idx]['close']
             return entry_time, entry_price
 
-    def scan_historical_signals(self, df: pd.DataFrame, pair: str, days_back: int) -> List[BalancedMarketSignal]:
-        """ПОКРАЩЕНИЙ: Сканування історичних сигналів з правильним часом входу"""
+    def print_detailed_signal_info(self, signal: AdvancedMarketSignal):
+        """Виведення детальної інформації про сигнал"""
+        status_emoji = "✅" if signal.status == SignalStatus.OPEN else "⏭️"
+
+        print(f"\n{status_emoji} {signal.pair} {signal.direction} - {signal.signal_time.strftime('%Y-%m-%d %H:%M')}")
+        print(
+            f"   Статус: {signal.status.value} | Впевненість: {signal.confidence_score:.1f}% | Якість: {signal.quality.value}")
+
+        if signal.status == SignalStatus.SKIP:
+            print(f"   💡 Причина пропуску: {signal.skip_reason}")
+
+        # Перевірки первинного таймфрейму
+        if signal.primary_checks_passed or signal.primary_checks_failed:
+            print(f"   📊 Первинний таймфрейм ({self.config.PRIMARY_TIMEFRAME}):")
+
+            if signal.primary_checks_passed:
+                print(f"      ✅ Успішні перевірки:")
+                for check in signal.primary_checks_passed:
+                    print(f"         • {check.name}: {check.value}")
+
+            if signal.primary_checks_failed:
+                print(f"      ❌ Невдалі перевірки:")
+                for check in signal.primary_checks_failed:
+                    print(f"         • {check.name}: {check.value}")
+
+        # Перевірки таймфрейму підтвердження
+        if signal.confirmation_checks_passed or signal.confirmation_checks_failed:
+            print(f"   🔍 Таймфрейм підтвердження ({self.config.CONFIRMATION_TIMEFRAME}):")
+
+            if signal.confirmation_checks_passed:
+                print(f"      ✅ Успішні перевірки:")
+                for check in signal.confirmation_checks_passed:
+                    print(f"         • {check.name}: {check.value}")
+
+            if signal.confirmation_checks_failed:
+                print(f"      ❌ Невдалі перевірки:")
+                for check in signal.confirmation_checks_failed:
+                    print(f"         • {check.name}: {check.value}")
+
+        # RSI дані
+        print(f"   📈 RSI дані:")
+        print(
+            f"      {self.config.PRIMARY_TIMEFRAME}: RSI={signal.rsi_1m:.2f}, SMA={signal.rsi_sma_1m:.2f}, Diff={signal.rsi_diff_1m:.2f}")
+        print(
+            f"      {self.config.CONFIRMATION_TIMEFRAME}: RSI={signal.rsi_5m:.2f}, SMA={signal.rsi_sma_5m:.2f}, Diff={signal.rsi_diff_5m:.2f}")
+
+    def scan_dual_timeframe_signals(self, df_primary: pd.DataFrame, df_confirmation: pd.DataFrame,
+                                    pair: str, days_back: int) -> List[AdvancedMarketSignal]:
+        """Сканирование сигналов по двухтаймфреймовой стратегии с детальною інформацією"""
         signals = []
 
-        if len(df) < 50:
-            self.logger.warning(f"Недостатньо даних для {pair}: {len(df)} свічок")
+        if len(df_primary) < 50 or len(df_confirmation) < 10:
+            print(
+                f"⚠️ {pair}: Недостатньо даних ({self.config.PRIMARY_TIMEFRAME}: {len(df_primary)}, {self.config.CONFIRMATION_TIMEFRAME}: {len(df_confirmation)})")
             return signals
 
         end_time = datetime.now()
         start_time = end_time - timedelta(days=days_back)
 
-        print(f"🔍 {pair}: Шукаємо сигнали від {start_time.strftime('%Y-%m-%d %H:%M')} "
-              f"до {end_time.strftime('%Y-%m-%d %H:%M')}")
+        print(f"🔍 {pair}: Шукаєм сигнали з {start_time.strftime('%Y-%m-%d %H:%M')}")
 
-        # Фільтруємо дані за періодом
-        df_period = df[df['datetime'] >= start_time].copy()
+        # Фильтруем данные по периоду
+        df_primary_period = df_primary[df_primary['datetime'] >= start_time].copy()
 
-        if len(df_period) < 10:
-            print(f"⚠️ {pair}: Недостатньо даних за період ({len(df_period)} свічок)")
+        if len(df_primary_period) < 10:
+            print(f"⚠️ {pair}: Недостатньо даних за період")
             return signals
 
-        print(f"📊 {pair}: Аналізуємо {len(df_period)} свічок за {days_back} днів")
+        print(f"📊 {pair}: Аналізуємо {len(df_primary_period)} свічей {self.config.PRIMARY_TIMEFRAME}")
 
-        last_signal_time = None
-        start_idx = df[df['datetime'] >= start_time].index[0] if len(df[df['datetime'] >= start_time]) > 0 else len(df)
+        # Находим начальный индекс
+        start_idx = df_primary[df_primary['datetime'] >= start_time].index[0] if len(
+            df_primary[df_primary['datetime'] >= start_time]) > 0 else len(df_primary)
         start_idx = max(20, start_idx)
 
-        for i in range(start_idx, len(df) - 1):
-            current_row = df.iloc[i]
+        for i in range(start_idx, len(df_primary) - 1):
+            current_row = df_primary.iloc[i]
 
-            if current_row['datetime'] < start_time:
-                continue
-            if current_row['datetime'] > end_time:
-                break
-
-            # Перевірка інтервалу між сигналами
-            if (last_signal_time and
-                    current_row['datetime'] - last_signal_time < timedelta(minutes=self.config.MIN_SIGNAL_INTERVAL)):
+            if current_row['datetime'] < start_time or current_row['datetime'] > end_time:
                 continue
 
-            # Базова перевірка RSI сигналу
-            direction, base_filters = self.check_basic_rsi_signal(df, i)
+            # Проверка сигнала по новой детальной логике
+            direction, primary_passed, primary_failed, confirmation_passed, confirmation_failed, status, skip_reason = \
+                self.check_advanced_rsi_signal(df_primary, df_confirmation, i, pair)
 
             if not direction:
                 continue
 
-            # Додаткові фільтри
-            additional_filters, comment = self.apply_additional_filters(df, direction, i)
-            all_filters = base_filters + additional_filters
-
-            # Перевірка мінімальної кількості фільтрів
-            if len(all_filters) < self.config.MIN_FILTERS_REQUIRED:
+            # Находим соответствующие данные на таймфрейме подтверждения
+            current_time = current_row['datetime']
+            df_confirmation_filtered = df_confirmation[df_confirmation['datetime'] <= current_time]
+            if len(df_confirmation_filtered) == 0:
                 continue
 
-            # Розрахунок впевненості та якості
-            confidence = self.calculate_confidence_score(
-                base_filters, additional_filters, current_row['rsi'], direction
+            current_confirmation = df_confirmation_filtered.iloc[-1]
+
+            # Расчет уверенности и качества
+            total_passed_checks = len(primary_passed) + len(confirmation_passed)
+            total_failed_checks = len(primary_failed) + len(confirmation_failed)
+
+            base_confidence = 50.0 if status == SignalStatus.SKIP else 70.0
+            confidence = min(95.0, base_confidence + total_passed_checks * 8.0 - total_failed_checks * 2.0)
+
+            if status == SignalStatus.OPEN:
+                if confidence >= 80 and total_passed_checks >= 5:
+                    quality = SignalQuality.HIGH
+                elif confidence >= 65 and total_passed_checks >= 3:
+                    quality = SignalQuality.MEDIUM
+                else:
+                    quality = SignalQuality.LOW
+            else:
+                quality = SignalQuality.LOW
+
+            # Расчет времени и цены входа
+            entry_time, entry_price = self.calculate_entry_time_and_price_advanced(
+                df_primary, i, current_row['datetime']
             )
-            quality = self.determine_signal_quality(confidence, len(all_filters))
 
-            # НОВИЙ: Розрахунок фактичного часу та ціни входу
-            entry_time, entry_price = self.calculate_entry_time_and_price(df, i, current_row['datetime'])
+            # Регистрируем ТОЛЬКО ПОДТВЕРЖДЕННЫЕ позиции для делея
+            if status == SignalStatus.OPEN:
+                self.register_confirmed_position(pair, direction, current_row['datetime'])
 
-            # Створення сигналу з новими полями
-            signal = BalancedMarketSignal(
+            # Создание сигнала с детальной информацией
+            signal = AdvancedMarketSignal(
                 pair=pair,
                 direction=direction,
-                signal_time=current_row['datetime'],  # Час виявлення сигналу
-                entry_time=entry_time,  # Фактичний час входу
-                rsi=current_row['rsi'],
-                rsi_sma=current_row['rsi_sma'],
-                signal_price=current_row['close'],  # Ціна на момент сигналу
-                entry_price=entry_price,  # Фактична ціна входу
+                signal_time=current_row['datetime'],
+                entry_time=entry_time,
+
+                # RSI данные основного таймфрейма
+                rsi_1m=current_row.get('rsi', 0),
+                rsi_sma_1m=current_row.get('rsi_sma', 0),
+                rsi_diff_1m=current_row.get('rsi_diff', 0),
+
+                # RSI данные таймфрейма подтверждения
+                rsi_5m=current_confirmation.get('rsi', 0),
+                rsi_sma_5m=current_confirmation.get('rsi_sma', 0),
+                rsi_diff_5m=current_confirmation.get('rsi_diff', 0),
+                avg_diff_5m=current_confirmation.get('avg_diff', 0),
+
+                signal_price=current_row['close'],
+                entry_price=entry_price,
                 quality=quality,
                 confidence_score=confidence,
-                filters_passed=all_filters,
-                comment=comment,
-                stoch_rsi=current_row.get('stoch_rsi', 0.0)
+                status=status,
+
+                # Детальна інформація про перевірки
+                primary_checks_passed=primary_passed,
+                primary_checks_failed=primary_failed,
+                confirmation_checks_passed=confirmation_passed,
+                confirmation_checks_failed=confirmation_failed,
+
+                skip_reason=skip_reason,
+                comment=f"{self.config.PRIMARY_TIMEFRAME} cross, {self.config.CONFIRMATION_TIMEFRAME} {'confirmed' if status == SignalStatus.OPEN else 'rejected'}"
             )
 
             signals.append(signal)
-            last_signal_time = current_row['datetime']
 
-        print(f"✅ {pair}: Знайдено {len(signals)} сигналів за {days_back} днів")
+            # Виводимо детальну інформацію про кожен сигнал
+            self.print_detailed_signal_info(signal)
+
         return signals
 
-    async def generate_balanced_signals(self, days_back: int = 3, output_file: str = None) -> List[
-        BalancedMarketSignal]:
-        """ПОКРАЩЕНИЙ: Генерація збалансованих сигналів з автоматичними множинними запитами"""
-        if output_file is None:
-            output_file = f'balanced_signals_{days_back}d.csv'
+    async def analyze_pair_advanced(self, pair: str, days_back: int = 7) -> List[AdvancedMarketSignal]:
+        """Аналіз пари з новою стратегією"""
+        try:
+            print(f"\n🔍 Аналізуємо {pair}...")
 
-        print(f"\n{'=' * 60}")
-        print(f"🎯 ЗБАЛАНСОВАНА ГЕНЕРАЦІЯ СИГНАЛІВ ЗА {days_back} ДНІВ")
-        print("=" * 60)
+            # Завантажуємо дані для двох таймфреймів
+            df_primary, df_confirmation = await self.fetch_dual_timeframe_data(pair, days_back)
 
-        # Розрахунок необхідних параметрів
-        required_candles = self.calculate_required_candles(days_back)
-        num_requests = self.calculate_required_requests(days_back)
-        minutes_per_candle = self.calculate_timeframe_minutes()
+            if df_primary is None or df_confirmation is None:
+                print(f"❌ {pair}: Не вдалося завантажити дані")
+                return []
 
-        print(f"📊 НАЛАШТУВАННЯ:")
-        print(f"   Таймфрейм: {self.config.TIMEFRAME} ({minutes_per_candle} хв)")
-        print(f"   Потрібно свічок: {required_candles}")
-        print(f"   Запитів до API: {num_requests}")
-        print(f"   Long зона: RSI ≤ {self.config.LONG_ZONE_MAX}")
-        print(f"   Short зона: RSI ≥ {self.config.SHORT_ZONE_MIN}")
-        print(f"   Мінімум фільтрів: {self.config.MIN_FILTERS_REQUIRED}")
+            # Обчислюємо індикатори для обох таймфреймів
+            df_primary = self.calculate_advanced_indicators(df_primary)
+            df_confirmation = self.calculate_advanced_indicators(df_confirmation)
 
-        if num_requests > 1:
-            candles_per_day = (24 * 60) // minutes_per_candle
-            days_per_request = self.config.MAX_CANDLES_PER_REQUEST / candles_per_day
-            print(f"   🔄 Множинні запити: ~{days_per_request:.1f} днів за запит")
-            print(f"   ⚡ Автоматичне об'єднання даних для повного покриття")
+            # Зберігаємо дані
+            self.market_data_1m[pair] = df_primary
+            self.market_data_5m[pair] = df_confirmation
 
-        target_end = datetime.now()
-        target_start = target_end - timedelta(days=days_back)
+            # Сканируем сигналы
+            signals = self.scan_dual_timeframe_signals(df_primary, df_confirmation, pair, days_back)
+
+            print(f"\n📊 {pair}: Знайдено {len(signals)} сигналів")
+            open_signals = [s for s in signals if s.status == SignalStatus.OPEN]
+            skip_signals = [s for s in signals if s.status == SignalStatus.SKIP]
+            print(f"   ✅ Підтверджених: {len(open_signals)}")
+            print(f"   ⏭️ Пропущених: {len(skip_signals)}")
+
+            return signals
+
+        except Exception as e:
+            self.logger.error(f"Помилка аналізу {pair}: {e}")
+            return []
+
+    def save_signals_to_csv(self, all_signals: List[AdvancedMarketSignal], filename: str = None):
+        """Збереження сигналів у CSV з детальною інформацією"""
+        if not all_signals:
+            print("📄 Немає сигналів для збереження")
+            return
+
+        if filename is None:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            filename = f"detailed_signals_{timestamp}.csv"
+
+        try:
+            with open(filename, 'w', newline='', encoding='utf-8') as file:
+                writer = csv.writer(file)
+
+                # Заголовки
+                headers = [
+                    'Pair', 'Direction', 'Status', 'Signal_Time', 'Entry_Time',
+                    f'RSI_{self.config.PRIMARY_TIMEFRAME}', f'RSI_SMA_{self.config.PRIMARY_TIMEFRAME}',
+                    f'RSI_Diff_{self.config.PRIMARY_TIMEFRAME}',
+                    f'RSI_{self.config.CONFIRMATION_TIMEFRAME}', f'RSI_SMA_{self.config.CONFIRMATION_TIMEFRAME}',
+                    f'RSI_Diff_{self.config.CONFIRMATION_TIMEFRAME}', f'Avg_Diff_{self.config.CONFIRMATION_TIMEFRAME}',
+                    'Signal_Price', 'Entry_Price', 'Quality', 'Confidence',
+                    f'Primary_Passed_{self.config.PRIMARY_TIMEFRAME}',
+                    f'Primary_Failed_{self.config.PRIMARY_TIMEFRAME}',
+                    f'Confirmation_Passed_{self.config.CONFIRMATION_TIMEFRAME}',
+                    f'Confirmation_Failed_{self.config.CONFIRMATION_TIMEFRAME}',
+                    'Skip_Reason', 'Comment'
+                ]
+                writer.writerow(headers)
+
+                # Дані
+                for signal in all_signals:
+                    # Форматування перевірок
+                    primary_passed_str = '; '.join([f"{c.name}: {c.value}" for c in signal.primary_checks_passed])
+                    primary_failed_str = '; '.join([f"{c.name}: {c.value}" for c in signal.primary_checks_failed])
+                    confirmation_passed_str = '; '.join(
+                        [f"{c.name}: {c.value}" for c in signal.confirmation_checks_passed])
+                    confirmation_failed_str = '; '.join(
+                        [f"{c.name}: {c.value}" for c in signal.confirmation_checks_failed])
+
+                    row = [
+                        signal.pair,
+                        signal.direction,
+                        signal.status.value,
+                        signal.signal_time.strftime('%Y-%m-%d %H:%M:%S'),
+                        signal.entry_time.strftime('%Y-%m-%d %H:%M:%S'),
+                        f"{signal.rsi_1m:.2f}",
+                        f"{signal.rsi_sma_1m:.2f}",
+                        f"{signal.rsi_diff_1m:.2f}",
+                        f"{signal.rsi_5m:.2f}",
+                        f"{signal.rsi_sma_5m:.2f}",
+                        f"{signal.rsi_diff_5m:.2f}",
+                        f"{signal.avg_diff_5m:.2f}",
+                        f"{signal.signal_price:.6f}",
+                        f"{signal.entry_price:.6f}",
+                        signal.quality.value,
+                        f"{signal.confidence_score:.1f}%",
+                        primary_passed_str,
+                        primary_failed_str,
+                        confirmation_passed_str,
+                        confirmation_failed_str,
+                        signal.skip_reason,
+                        signal.comment
+                    ]
+                    writer.writerow(row)
+
+            print(f"📄 Детальні сигнали збережено у {filename}")
+
+            # Статистика
+            open_signals = [s for s in all_signals if s.status == SignalStatus.OPEN]
+            skip_signals = [s for s in all_signals if s.status == SignalStatus.SKIP]
+
+            print(f"📈 Загальна статистика:")
+            print(f"   Всього сигналів: {len(all_signals)}")
+            print(f"   Підтверджених позицій: {len(open_signals)}")
+            print(f"   Пропущених сигналів: {len(skip_signals)}")
+
+            if open_signals:
+                long_signals = [s for s in open_signals if s.direction == 'Long']
+                short_signals = [s for s in open_signals if s.direction == 'Short']
+                print(f"   Long: {len(long_signals)}, Short: {len(short_signals)}")
+
+                avg_confidence = sum(s.confidence_score for s in open_signals) / len(open_signals)
+                print(f"   Середня впевненість: {avg_confidence:.1f}%")
+
+        except Exception as e:
+            self.logger.error(f"Помилка збереження у CSV: {e}")
+
+    async def run_advanced_analysis(self, days_back: int = 7):
+        """Запуск поглибленого аналізу для всіх пар"""
         print(
-            f"   📅 Цільовий період: {target_start.strftime('%Y-%m-%d %H:%M')} - {target_end.strftime('%Y-%m-%d %H:%M')}")
-
-        active_filters = []
-        if self.config.USE_STOCH_RSI_FILTER: active_filters.append("StochRSI")
-        if self.config.USE_MACD_FILTER: active_filters.append("MACD")
-        if self.config.USE_TREND_FILTER: active_filters.append("Trend")
-        if self.config.USE_VOLUME_FILTER: active_filters.append("Volume")
-        if self.config.USE_VOLATILITY_FILTER: active_filters.append("Volatility")
-        if self.config.USE_DIVERGENCE_FILTER: active_filters.append("Divergence")
-
-        print(f"   🔧 Активні фільтри: {', '.join(active_filters) if active_filters else 'Base RSI only'}")
-        print(f"   ⏱️  НОВА ОСОБЛИВІСТЬ: Точний час входу = час сигналу + 1 свічка + 1хв")
-        print()
+            f"🚀 Запуск аналізу за покращеною стратегією ({self.config.PRIMARY_TIMEFRAME}/{self.config.CONFIRMATION_TIMEFRAME})")
+        print(f"📅 Період: {days_back} днів")
+        print(f"💰 Пари: {len(self.config.PAIRS)}")
+        print(f"🔧 Делей працює тільки для підтверджених сигналів!")
 
         all_signals = []
-        processed_pairs = 0
-        failed_pairs = 0
 
         for pair in self.config.PAIRS:
             try:
-                print(f"📈 Обробка {pair}...")
-
-                # Використовуємо покращений метод з автоматичними множинними запитами
-                df = await self.fetch_extended_ohlcv(pair, days_back)
-                if df is None:
-                    print(f"❌ {pair}: Немає даних")
-                    failed_pairs += 1
-                    continue
-
-                # Перевірка достатності даних
-                if len(df) < 50:
-                    print(f"⚠️ {pair}: Недостатньо даних ({len(df)} свічок)")
-                    failed_pairs += 1
-                    continue
-
-                # Розрахунок індикаторів
-                df = self.calculate_indicators(df)
-
-                # Сканування сигналів
-                signals = self.scan_historical_signals(df, pair, days_back)
+                signals = await self.analyze_pair_advanced(pair, days_back)
                 all_signals.extend(signals)
 
-                print(f"✅ {pair}: {len(signals)} сигналів")
-                processed_pairs += 1
-
-                # Затримка між парами для уникнення перевантаження API
-                await asyncio.sleep(0.5)
+                # Пауза між запитами
+                await asyncio.sleep(1)
 
             except Exception as e:
-                print(f"❌ {pair}: Помилка - {str(e)[:50]}...")
-                failed_pairs += 1
+                print(f"❌ Помилка аналізу {pair}: {e}")
                 continue
 
-        # Сортування сигналів за часом
-        all_signals.sort(key=lambda x: x.signal_time)
-
-        print(f"\n📊 ПІДСУМОК ОБРОБКИ:")
-        print(f"   ✅ Успішно оброблено пар: {processed_pairs}")
-        print(f"   ❌ Помилок: {failed_pairs}")
-        print(f"   🎯 Всього сигналів: {len(all_signals)}")
-
-        # Детальна статистика покриття періоду
+        # Зберігаємо результати
         if all_signals:
-            oldest_signal = min(s.signal_time for s in all_signals)
-            newest_signal = max(s.signal_time for s in all_signals)
-            actual_days = (newest_signal - oldest_signal).days + 1
+            self.save_signals_to_csv(all_signals)
 
-            print(f"\n📅 ПОКРИТТЯ ПЕРІОДУ:")
-            print(f"   Запитаний період: {days_back} днів")
-            print(f"   Фактичний діапазон сигналів: {actual_days} днів")
-            print(f"   Від: {oldest_signal.strftime('%Y-%m-%d %H:%M')}")
-            print(f"   До: {newest_signal.strftime('%Y-%m-%d %H:%M')}")
-
-            # Перевірка якості покриття
-            coverage_percentage = (actual_days / days_back) * 100
-            if coverage_percentage >= 90:
-                print(f"   ✅ Покриття: {coverage_percentage:.1f}% - відмінно!")
-            elif coverage_percentage >= 70:
-                print(f"   ⚠️ Покриття: {coverage_percentage:.1f}% - добре")
-            else:
-                print(f"   ❌ Покриття: {coverage_percentage:.1f}% - потрібно більше даних")
-
-        # Збереження та статистика
-        if all_signals:
-            await self.save_signals_to_csv(all_signals, output_file)
-            self.print_signal_statistics(all_signals)
-        else:
-            print(f"\n⚠️ Сигналів не знайдено за {days_back} днів")
-            print("💡 РЕКОМЕНДАЦІЇ:")
-            print("   • Розширте RSI зони (Long≤45, Short≥55)")
-            print("   • Зменште кількість обов'язкових фільтрів")
-            print("   • Спробуйте інший таймфрейм (15m, 1h)")
-            print("   • Перевірте підключення до інтернету")
+        print(f"\n✅ Аналіз завершено. Знайдено {len(all_signals)} сигналів")
+        print(f"📊 Підтверджених: {len([s for s in all_signals if s.status == SignalStatus.OPEN])}")
+        print(f"⏭️ Пропущених: {len([s for s in all_signals if s.status == SignalStatus.SKIP])}")
 
         return all_signals
 
-    async def save_signals_to_csv(self, signals: List[BalancedMarketSignal], filename: str):
-        """ПОКРАЩЕНИЙ: Збереження сигналів у CSV з новими полями"""
-        try:
-            with open(filename, 'w', newline='', encoding='utf-8') as csvfile:
-                fieldnames = [
-                    'SignalTime', 'EntryTime', 'Pair', 'Exchange', 'Timeframe', 'Direction',
-                    'Quality', 'Confidence', 'RSI', 'RSI_SMA', 'SignalPrice', 'EntryPrice',
-                    'PriceChange%', 'FiltersCount', 'FiltersPassed', 'Comment'
-                ]
 
-                writer = csv.DictWriter(csvfile, delimiter=';', fieldnames=fieldnames)
-                writer.writeheader()
-
-                for signal in signals:
-                    # Розрахунок зміни ціни між сигналом і входом
-                    price_change = ((signal.entry_price - signal.signal_price) / signal.signal_price) * 100
-
-                    writer.writerow({
-                        'SignalTime': signal.signal_time.strftime("%d.%m.%Y %H:%M"),
-                        'EntryTime': signal.entry_time.strftime("%d.%m.%Y %H:%M"),
-                        'Pair': signal.pair.replace('/', '').replace(':MATIC', ''),
-                        'Exchange': 'BYBIT',
-                        'Timeframe': self.config.TIMEFRAME,
-                        'Direction': signal.direction,
-                        'Quality': signal.quality.value,
-                        'Confidence': f"{signal.confidence_score:.1f}%",
-                        'RSI': round(signal.rsi, 2),
-                        'RSI_SMA': round(signal.rsi_sma, 2),
-                        'SignalPrice': signal.signal_price,
-                        'EntryPrice': signal.entry_price,
-                        'PriceChange%': f"{price_change:.3f}%",
-                        'FiltersCount': len(signal.filters_passed),
-                        'FiltersPassed': ', '.join(signal.filters_passed),
-                        'Comment': signal.comment[:200] + '...' if len(signal.comment) > 200 else signal.comment
-                    })
-
-            print(f"\n💾 Сигнали збережено у файл: {filename}")
-            print(f"📊 Нові поля в CSV: SignalTime, EntryTime, SignalPrice, EntryPrice, PriceChange%")
-
-        except Exception as e:
-            self.logger.error(f"Помилка збереження: {e}")
-
-    def print_signal_statistics(self, signals: List[BalancedMarketSignal]):
-        """ПОКРАЩЕНА: Детальна статистика сигналів з новими метриками"""
-        if not signals:
-            return
-
-        print(f"\n{'=' * 60}")
-        print("📊 ДЕТАЛЬНА СТАТИСТИКА СИГНАЛІВ")
-        print("=" * 60)
-
-        total = len(signals)
-        long_count = sum(1 for s in signals if s.direction == 'Long')
-        short_count = total - long_count
-
-        print(f"📈 ЗАГАЛЬНА ІНФОРМАЦІЯ:")
-        print(f"   Всього сигналів: {total}")
-        print(f"   🟢 LONG: {long_count} ({long_count / total * 100:.1f}%)")
-        print(f"   🔴 SHORT: {short_count} ({short_count / total * 100:.1f}%)")
-
-        # Статистика по якості
-        quality_stats = {}
-        for signal in signals:
-            quality_stats[signal.quality.value] = quality_stats.get(signal.quality.value, 0) + 1
-
-        print(f"\n🎯 РОЗПОДІЛ ПО ЯКОСТІ:")
-        for quality, count in sorted(quality_stats.items()):
-            print(f"   {quality}: {count} ({count / total * 100:.1f}%)")
-
-        # Середня впевненість
-        avg_confidence = sum(s.confidence_score for s in signals) / len(signals)
-        print(f"\n📊 СЕРЕДНЯ ВПЕВНЕНІСТЬ: {avg_confidence:.1f}%")
-
-        # НОВА: Статистика зміни ціни між сигналом і входом
-        price_changes = []
-        for signal in signals:
-            change = ((signal.entry_price - signal.signal_price) / signal.signal_price) * 100
-            price_changes.append(change)
-
-        if price_changes:
-            avg_price_change = sum(price_changes) / len(price_changes)
-            max_price_change = max(price_changes)
-            min_price_change = min(price_changes)
-
-            print(f"\n💰 ЗМІНА ЦІНИ (СИГНАЛ → ВХІД):")
-            print(f"   Середня зміна: {avg_price_change:.3f}%")
-            print(f"   Максимальна: {max_price_change:.3f}%")
-            print(f"   Мінімальна: {min_price_change:.3f}%")
-
-        # Топ пари
-        pair_counts = {}
-        for signal in signals:
-            clean_pair = signal.pair.replace('/', '').replace(':MATIC', '')
-            pair_counts[clean_pair] = pair_counts.get(clean_pair, 0) + 1
-
-        print(f"\n🏆 ТОП-5 АКТИВНИХ ПАР:")
-        for pair, count in sorted(pair_counts.items(), key=lambda x: x[1], reverse=True)[:5]:
-            print(f"   {pair}: {count} сигналів ({count / total * 100:.1f}%)")
-
-        # Розподіл по днях
-        daily_counts = {}
-        for signal in signals:
-            day_key = signal.signal_time.strftime('%Y-%m-%d')
-            daily_counts[day_key] = daily_counts.get(day_key, 0) + 1
-
-        if len(daily_counts) > 1:
-            print(f"\n📅 РОЗПОДІЛ ПО ДНЯХ:")
-            for day, count in sorted(daily_counts.items()):
-                day_formatted = datetime.strptime(day, '%Y-%m-%d').strftime('%m/%d')
-                print(f"   {day_formatted}: {count} сигналів ({count / total * 100:.1f}%)")
-
-        # ПОКРАЩЕНО: Останні 5 сигналів з часом входу
-        print(f"\n🔥 ОСТАННІ 5 СИГНАЛІВ:")
-        for signal in signals[-5:]:
-            clean_pair = signal.pair.replace('/', '').replace(':MATIC', '')
-            time_delay = signal.entry_time - signal.signal_time
-            delay_minutes = int(time_delay.total_seconds() / 60)
-
-            print(
-                f"   📅 {signal.signal_time.strftime('%m/%d %H:%M')} → {signal.entry_time.strftime('%H:%M')} (+{delay_minutes}хв)")
-            print(f"   💼 {clean_pair} {signal.direction} | {signal.quality.value} ({signal.confidence_score:.1f}%)")
-            print(f"   💰 RSI:{signal.rsi:.1f} | ${signal.signal_price:.4f} → ${signal.entry_price:.4f}")
-            print()
-
-
-def get_user_days_input(default_days: int) -> int:
-    """НОВИЙ: Функція для введення кількості днів користувачем"""
-    while True:
-        try:
-            user_input = input(f"Скільки днів аналізувати? (1-30, за замовчуванням {default_days}): ").strip()
-
-            if not user_input:  # Якщо користувач просто натиснув Enter
-                return default_days
-
-            days = int(user_input)
-
-            if 1 <= days <= 30:
-                return days
-            else:
-                print("❌ Будь ласка, введіть число від 1 до 30")
-
-        except ValueError:
-            print("❌ Будь ласка, введіть коректне число")
-
-
+# Головна функція запуску
 async def main():
-    """ПОКРАЩЕНА: Головна функція з можливістю вибору днів для всіх варіантів"""
-    print("🚀 ПОКРАЩЕНИЙ ГЕНЕРАТОР СИГНАЛІВ v2.0")
-    print("✨ НОВИНКИ:")
-    print("   • Точний час входу (наступна свічка + 1хв)")
-    print("   • Автоматичні множинні API запити для будь-якого періоду")
-    print("   • Можливість введення днів для всіх режимів")
-    print("=" * 60)
-    print("1 - М'які фільтри (рекомендовано 2-5 днів)")
-    print("2 - Нормальні фільтри (рекомендовано 3-7 днів)")
-    print("3 - Строгі фільтри (рекомендовано 5-14 днів)")
-    print("4 - Власні налаштування")
-    print("5 - Швидкий тест (ТОП-3 пари)")
-    print("6 - Демонстрація великого періоду (14+ днів)")
+    """Головна функція"""
+    # Створюємо конфігурацію
+    config = AdvancedConfig(
+        # Налаштування таймфреймів
+        PRIMARY_TIMEFRAME='1m',
+        CONFIRMATION_TIMEFRAME='5m',
 
-    choice = input("\nОберіть опцію (1-6): ").strip()
+        # Налаштування параметрів стратегії
+        MIN_DIFF=2.0,
+        TREND_CANDLES=3,
+        DELAY_CANDLES=5,
+        LONG_ENTRY_MAX_RSI=40.0,
+        SHORT_ENTRY_MIN_RSI=60.0,
+        PREOVERSOLD_LEVEL=33.0,
+        PREBOUGHT_LEVEL=67.0,
 
-    # Налаштування за вибором
-    if choice == '1':
-        # М'які фільтри
-        config = BalancedConfig()
-        config.MIN_FILTERS_REQUIRED = 1
-        config.LONG_ZONE_MAX = 45.0
-        config.SHORT_ZONE_MIN = 55.0
-        config.USE_STOCH_RSI_FILTER = True
-        config.USE_MACD_FILTER = False
-        config.USE_DIVERGENCE_FILTER = True
-        print("🟢 М'які фільтри: Long≤45, Short≥55, мінімум 1 фільтр")
-        days_back = get_user_days_input(3)
+        # Торгові пари
+        PAIRS=[
+            'BTC/USDT', 'ETH/USDT', 'SOL/USDT', 'ADA/USDT', 'DOT/USDT',
+            'AVAX/USDT', 'LINK/USDT', 'UNI/USDT', 'ATOM/USDT',
+            'LTC/USDT', 'BCH/USDT', 'XRP/USDT', 'DOGE/USDT', 'SHIB/USDT'
+        ]
+    )
 
-    elif choice == '2':
-        # Нормальні фільтри
-        config = BalancedConfig()
-        config.MIN_FILTERS_REQUIRED = 2
-        config.USE_STOCH_RSI_FILTER = True
-        config.USE_MACD_FILTER = True
-        print("🟡 Нормальні фільтри: Long≤40, Short≥60, мінімум 2 фільтри")
-        days_back = get_user_days_input(5)
+    # Створюємо генератор сигналів
+    generator = AdvancedSignalGenerator(config)
 
-    elif choice == '3':
-        # Строгі фільтри
-        config = BalancedConfig()
-        config.MIN_FILTERS_REQUIRED = 3
-        config.LONG_ZONE_MAX = 35.0
-        config.SHORT_ZONE_MIN = 65.0
-        config.USE_TREND_FILTER = True
-        config.USE_VOLUME_FILTER = True
-        config.USE_STOCH_RSI_FILTER = True
-        config.USE_MACD_FILTER = True
-        print("🔴 Строгі фільтри: Long≤35, Short≥65, мінімум 3 фільтри")
-        days_back = get_user_days_input(7)
-
-    elif choice == '4':
-        # Власні налаштування
-        config = BalancedConfig()
-        print(f"\n⚙️ НАЛАШТУВАННЯ ФІЛЬТРІВ:")
-
-        long_zone = input(f"Long зона (поточна {config.LONG_ZONE_MAX}): ").strip()
-        if long_zone and long_zone.replace('.', '').isdigit():
-            config.LONG_ZONE_MAX = float(long_zone)
-
-        short_zone = input(f"Short зона (поточна {config.SHORT_ZONE_MIN}): ").strip()
-        if short_zone and short_zone.replace('.', '').isdigit():
-            config.SHORT_ZONE_MIN = float(short_zone)
-
-        min_filters = input(f"Мінімум фільтрів (поточне {config.MIN_FILTERS_REQUIRED}): ").strip()
-        if min_filters and min_filters.isdigit():
-            config.MIN_FILTERS_REQUIRED = int(min_filters)
-
-        # Вибір фільтрів
-        print("\n🔧 Увімкнути додаткові фільтри? (y/n)")
-        config.USE_STOCH_RSI_FILTER = input("StochRSI: ").lower().startswith('y')
-        config.USE_MACD_FILTER = input("MACD: ").lower().startswith('y')
-        config.USE_TREND_FILTER = input("Trend: ").lower().startswith('y')
-        config.USE_VOLUME_FILTER = input("Volume: ").lower().startswith('y')
-        config.USE_VOLATILITY_FILTER = input("Volatility: ").lower().startswith('y')
-
-        days_back = get_user_days_input(5)
-
-    elif choice == '5':
-        # Швидкий тест
-        config = BalancedConfig()
-        config.PAIRS = ['BTC/USDT', 'ETH/USDT', 'SOL/USDT']
-        config.MIN_FILTERS_REQUIRED = 1
-        print("⚡ Швидкий тест на ТОП-3 парах")
-        days_back = get_user_days_input(3)
-
-    elif choice == '6':
-        # Демонстрація великого періоду
-        config = BalancedConfig()
-        config.MIN_FILTERS_REQUIRED = 2
-        config.USE_STOCH_RSI_FILTER = True
-        config.USE_MACD_FILTER = True
-        config.USE_TREND_FILTER = True
-        print("🚀 Демонстрація великого періоду з множинними запитами!")
-        print("📊 Покаже потужність нової системи завантаження даних")
-        days_back = get_user_days_input(14)
-
-    else:
-        print("❌ Невірний вибір")
-        return
-
-    # Інформування про стратегію завантаження
-    generator = BalancedSignalGenerator(config)
-    required_candles = generator.calculate_required_candles(days_back)
-    num_requests = generator.calculate_required_requests(days_back)
-
-    print(f"\n📊 ПЛАН ВИКОНАННЯ:")
-    print(f"   📅 Період аналізу: {days_back} днів")
-    print(f"   🕐 Таймфрейм: {config.TIMEFRAME}")
-    print(f"   📊 Потрібно свічок: {required_candles}")
-    print(f"   🔄 Кількість API запитів: {num_requests}")
-
-    if num_requests > 1:
-        print(f"   ✨ Буде використано автоматичне об'єднання даних!")
-        print(f"   ⚡ Система забезпечить повне покриття {days_back} днів")
-    else:
-        print(f"   📥 Достатньо одного API запиту")
-
-    print(f"\n🔄 Починаємо аналіз...")
-
-    # Генерація сигналів
-    output_file = f'improved_signals_{choice}_{days_back}d.csv'
-    signals = await generator.generate_balanced_signals(days_back, output_file)
-
-    if signals:
-        print(f"\n🎉 УСПІШНО ЗАВЕРШЕНО!")
-        print(f"   ✅ Згенеровано {len(signals)} сигналів")
-        print(f"   📁 Збережено у файл: {output_file}")
-        print(f"   🎯 Нова особливість: точний час і ціна входу!")
-
-        # Показуємо приклад найновішого сигналу
-        if len(signals) > 0:
-            latest = signals[-1]
-            clean_pair = latest.pair.replace('/', '').replace(':MATIC', '')
-            time_diff = latest.entry_time - latest.signal_time
-            delay_minutes = int(time_diff.total_seconds() / 60)
-
-            print(f"\n🔥 ПРИКЛАД ОСТАННЬОГО СИГНАЛУ:")
-            print(f"   📅 Час сигналу: {latest.signal_time.strftime('%d.%m %H:%M')}")
-            print(f"   ⏰ Час входу: {latest.entry_time.strftime('%d.%m %H:%M')} (+{delay_minutes} хв)")
-            print(f"   💼 {clean_pair} {latest.direction} | {latest.quality.value}")
-            print(f"   💰 Ціна сигналу: ${latest.signal_price:.4f}")
-            print(f"   💰 Ціна входу: ${latest.entry_price:.4f}")
-    else:
-        print(f"\n⚠️ Сигналів не знайдено за {days_back} днів")
-        print("💡 ПОРАДИ ДЛЯ ПОКРАЩЕННЯ РЕЗУЛЬТАТІВ:")
-        print("   • Розширте RSI зони (наприклад, Long≤45, Short≥55)")
-        print("   • Зменште мінімальну кількість фільтрів")
-        print("   • Спробуйте більший період (7-14 днів)")
-        print("   • Використайте м'які фільтри (варіант 1)")
-
-
-if __name__ == "__main__":
+    # Запускаємо аналіз
     try:
-        asyncio.run(main())
+        signals = await generator.run_advanced_analysis(days_back=7)
+
+        # Додатковий аналіз результатів
+        if signals:
+            print(f"\n📊 Детальна статистика:")
+
+            open_signals = [s for s in signals if s.status == SignalStatus.OPEN]
+            skip_signals = [s for s in signals if s.status == SignalStatus.SKIP]
+
+            if open_signals:
+                print(f"🟢 Підтверджені позиції ({len(open_signals)}):")
+                for signal in open_signals[-5:]:  # Показуємо останні 5
+                    total_checks = len(signal.primary_checks_passed) + len(signal.confirmation_checks_passed)
+                    print(f"   {signal.pair} {signal.direction} {signal.signal_time.strftime('%m-%d %H:%M')} "
+                          f"Впевненість: {signal.confidence_score:.1f}% Перевірок пройдено: {total_checks}")
+
+            if skip_signals:
+                print(f"🟡 Пропущені сигнали ({len(skip_signals)}):")
+                skip_reasons = {}
+                for signal in skip_signals:
+                    reason = signal.skip_reason
+                    if reason in skip_reasons:
+                        skip_reasons[reason] += 1
+                    else:
+                        skip_reasons[reason] = 1
+
+                for reason, count in sorted(skip_reasons.items(), key=lambda x: x[1], reverse=True)[:5]:
+                    print(f"   {reason}: {count} разів")
+
     except KeyboardInterrupt:
         print("\n⏹️ Аналіз перервано користувачем")
     except Exception as e:
         print(f"\n❌ Критична помилка: {e}")
-        print("💡 Перевірте підключення до інтернету та API біржі")
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
