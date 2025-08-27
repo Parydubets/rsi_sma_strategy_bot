@@ -36,7 +36,7 @@ class Config:
 
             with open(self.config_path, 'r', encoding='utf-8') as f:
                 self.config_data = yaml.safe_load(f)
-
+            print(self.config_data)
             # Підстановка змінних середовища
             self._substitute_env_vars(self.config_data)
 

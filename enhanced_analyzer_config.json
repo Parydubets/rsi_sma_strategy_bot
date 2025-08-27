@@ -1,0 +1,73 @@
+{
+    "trading_parameters": {
+        "stop_loss": 0.012,
+        "take_profit": 0.025,
+        "max_hold_hours": 8,
+        "use_trailing_stop": false
+    },
+    "rsi_parameters": {
+        "long_exit_zone": 68,
+        "short_exit_zone": 32,
+        "long_extreme_exit": 78,
+        "short_extreme_exit": 22
+    },
+    "filters": {
+        "use_filters": true,
+        "min_filters_required": 4,
+        "use_trend_filter": true,
+        "use_adx_filter": true,
+        "use_volatility_filter": true,
+        "use_volume_filter": true,
+        "use_momentum_filter": true
+    },
+    "filter_thresholds": {
+        "min_adx": 22,
+        "min_volatility": 0.15,
+        "max_volatility": 2.2,
+        "min_volume_ratio": 0.9
+    },
+    "timeframe_settings": {
+        "primary_timeframe": "5m",
+        "secondary_timeframes": ["15m", "1h"],
+        "trend_weights": {
+            "5m": 0.4,
+            "15m": 0.35,
+            "1h": 0.25
+        }
+    },
+    "technical_indicators": {
+        "5m": {
+            "rsi_period": 14,
+            "sma_fast": 20,
+            "sma_slow": 50,
+            "adx_period": 14,
+            "ema_fast": 12,
+            "ema_slow": 26,
+            "atr_period": 14,
+            "bb_period": 20,
+            "volume_window": 20
+        },
+        "15m": {
+            "rsi_period": 14,
+            "sma_fast": 20,
+            "sma_slow": 50,
+            "adx_period": 14,
+            "ema_fast": 21,
+            "ema_slow": 50,
+            "atr_period": 14,
+            "bb_period": 20,
+            "volume_window": 40
+        },
+        "1h": {
+            "rsi_period": 14,
+            "sma_fast": 50,
+            "sma_slow": 200,
+            "adx_period": 14,
+            "ema_fast": 50,
+            "ema_slow": 200,
+            "atr_period": 20,
+            "bb_period": 20,
+            "volume_window": 50
+        }
+    }
+}

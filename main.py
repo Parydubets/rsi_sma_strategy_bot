@@ -17,7 +17,7 @@ from src.bot import TradingBot
 from src.config import Config
 from src.data_manager import DataManager
 from src.backtest import BacktestEngine
-from src.utils.logger import setup_logging
+#from src.utils.logger import setup_logging
 
 
 class BotManager:
@@ -36,7 +36,7 @@ class BotManager:
             await self.config.load()
 
             # Налаштування логування
-            setup_logging(self.config.get('logging', {}))
+            #setup_logging(self.config.get('logging', {}))
 
             # Створення директорій
             self._create_directories()

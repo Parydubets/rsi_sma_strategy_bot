@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """
-Покращений генератор торгових сигналів v2.2
-ОНОВЛЕНА ЛОГІКА:
-- Повна інформація про всі перевірки
-- Делей тільки для підтверджених сигналів
+Покращений генератор торгових сигналів v2.3 (ЗАВЕРШЕНИЙ)
+НОВІ МОЖЛИВОСТІ:
+- Перевірки об'єму та волатільності
+- Покращена система скорингу
+- Вибір періоду для сигналів
+- Об'єднана система confidence та scoring
 """
 
 import ccxt
@@ -13,7 +15,7 @@ import numpy as np
 from datetime import datetime, timedelta
 from ta.momentum import RSIIndicator
 from ta.trend import SMAIndicator, EMAIndicator
-from ta.volatility import BollingerBands
+from ta.volatility import BollingerBands, AverageTrueRange
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 import logging
@@ -34,22 +36,70 @@ class AdvancedConfig:
     ])
 
     # ТАЙМФРЕЙМИ (налаштовувані)
-    PRIMARY_TIMEFRAME: str = '1m'  # Основний для входу
-    CONFIRMATION_TIMEFRAME: str = '5m'  # Підтвердження
+    PRIMARY_TIMEFRAME: str = '5m'  # Основний для входу
+    CONFIRMATION_TIMEFRAME: str = '15m'  # Підтвердження
+
+    # НОВИЙ: Період для сигналів (можна вибирати)
+    SIGNAL_PERIOD_HOURS: int = 24  # За скільки годин шукати сигнали (можна змінити на будь-який період)
+    SIGNAL_PERIOD_DAYS: int = 0  # Додатково дні (для більших періодів)
 
     # ОНОВЛЕНІ ПАРАМЕТРИ СТРАТЕГІЇ
     RSI_PERIOD: int = 14
     RSI_SMA_PERIOD: int = 14
     MIN_DIFF: float = 2.0
     TREND_CANDLES: int = 3
-    DELAY_CANDLES: int = 5
+    DELAY_CANDLES: int = 12
     LONG_ENTRY_MAX_RSI: float = 40.0
     SHORT_ENTRY_MIN_RSI: float = 60.0
     OVERBOUGHT_LEVEL: float = 70.0
     OVERSOLD_LEVEL: float = 30.0
-    PREOVERSOLD_LEVEL: float = 33.0  # НОВИЙ параметр для закриття SHORT
-    PREBOUGHT_LEVEL: float = 67.0  # НОВИЙ параметр для закриття LONG
+    PREOVERSOLD_LEVEL: float = 33.0
+    PREBOUGHT_LEVEL: float = 67.0
     DIFF_SMOOTHING_PERIODS: int = 3
+
+    # НОВІ ПАРАМЕТРИ ОБ'ЄМУ
+    USE_VOLUME_CHECKS: bool = True
+    VOLUME_SMA_PERIOD: int = 20
+    MIN_VOLUME_MULTIPLIER: float = 1.15  # Мінімальний множник об'єму відносно середнього
+    HIGH_VOLUME_MULTIPLIER: float = 1.8  # Високий об'єм для бонусних балів
+
+    # НОВІ ПАРАМЕТРИ ВОЛАТІЛЬНОСТІ
+    USE_VOLATILITY_CHECKS: bool = True
+    ATR_PERIOD: int = 14
+    MIN_VOLATILITY_MULTIPLIER: float = 0.8  # Мінімальна волатільність
+    HIGH_VOLATILITY_MULTIPLIER: float = 1.5  # Висока волатільність для бонусних балів
+
+    # СИСТЕМА СКОРИНГУ
+    SCORING_SYSTEM: Dict[str, float] = field(default_factory=lambda: {
+        # Базові бали за перевірки
+        'primary_check_passed': 15.0,
+        'confirmation_check_passed': 20.0,
+        'primary_check_failed': -10.0,
+        'confirmation_check_failed': -15.0,
+
+        # Бонуси за якість сигналу
+        'perfect_rsi_cross': 10.0,  # Ідеальний перетин RSI/SMA
+        'strong_diff': 8.0,  # Сильна різниця RSI-SMA
+        'trend_alignment': 6.0,  # Тренд в правильному напрямку
+
+        # Бонуси за об'єм
+        'normal_volume': 3.0,  # Нормальний об'єм
+        'high_volume': 8.0,  # Високий об'єм
+        'very_high_volume': 12.0,  # Дуже високий об'єм
+
+        # Бонуси за волатільність
+        'normal_volatility': 2.0,  # Нормальна волатільність
+        'high_volatility': 6.0,  # Висока волатільність
+        'optimal_volatility': 10.0,  # Оптимальна волатільність
+
+        # Штрафи
+        'low_volume': -5.0,  # Низький об'єм
+        'low_volatility': -3.0,  # Низька волатільність
+        'weak_signal': -4.0,  # Слабкий сигнал
+
+        # Базовий скор
+        'base_score': 50.0
+    })
 
     # Болінгер бенди (опціонально)
     USE_BOLLINGER: bool = False
@@ -63,9 +113,11 @@ class AdvancedConfig:
 
 
 class SignalQuality(Enum):
-    HIGH = "High"
-    MEDIUM = "Medium"
-    LOW = "Low"
+    EXCELLENT = "Excellent"  # 85-100 балів
+    HIGH = "High"  # 70-84 балів
+    MEDIUM = "Medium"  # 55-69 балів
+    LOW = "Low"  # 40-54 балів
+    POOR = "Poor"  # < 40 балів
 
 
 class SignalStatus(Enum):
@@ -81,6 +133,43 @@ class CheckResult:
     passed: bool
     value: str
     description: str
+    score_impact: float = 0.0  # Вплив на загальний скор
+
+
+@dataclass
+class VolumeAnalysis:
+    """Аналіз об'єму"""
+    current_volume: float
+    avg_volume: float
+    volume_ratio: float
+    is_above_average: bool
+    volume_score: float
+    volume_quality: str
+
+
+@dataclass
+class VolatilityAnalysis:
+    """Аналіз волатільності"""
+    current_atr: float
+    avg_atr: float
+    volatility_ratio: float
+    is_adequate: bool
+    volatility_score: float
+    volatility_quality: str
+
+
+@dataclass
+class SignalScore:
+    """Детальний скор сигналу"""
+    base_score: float
+    technical_score: float
+    volume_score: float
+    volatility_score: float
+    bonus_score: float
+    penalty_score: float
+    total_score: float
+    max_possible_score: float
+    score_percentage: float
 
 
 @dataclass
@@ -104,8 +193,13 @@ class AdvancedMarketSignal:
     signal_price: float
     entry_price: float
     quality: SignalQuality
-    confidence_score: float
+    confidence_score: float  # Тепер синхронізований з total_score
     status: SignalStatus
+
+    # НОВІ: Аналіз об'єму та волатільності
+    volume_analysis: VolumeAnalysis
+    volatility_analysis: VolatilityAnalysis
+    signal_score: SignalScore
 
     # Детальна інформація про перевірки
     primary_checks_passed: List[CheckResult]
@@ -156,6 +250,18 @@ class AdvancedSignalGenerator:
             '1h': 60, '4h': 240, '1d': 1440
         }
         return timeframe_minutes.get(timeframe, 1)
+
+    def get_signal_period_days(self) -> int:
+        """Розрахунок загального періоду в днях для сигналів"""
+        total_hours = self.config.SIGNAL_PERIOD_HOURS + (self.config.SIGNAL_PERIOD_DAYS * 24)
+        return max(1, int(total_hours / 24)) + 1  # +1 для запасу даних
+
+    def get_signal_period_timedelta(self) -> timedelta:
+        """Повертає timedelta для періоду сигналів"""
+        return timedelta(
+            days=self.config.SIGNAL_PERIOD_DAYS,
+            hours=self.config.SIGNAL_PERIOD_HOURS
+        )
 
     async def fetch_dual_timeframe_data(self, symbol: str, days_back: int) -> Tuple[
         Optional[pd.DataFrame], Optional[pd.DataFrame]]:
@@ -279,7 +385,7 @@ class AdvancedSignalGenerator:
             return None
 
     def calculate_advanced_indicators(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Розрахунок індикаторів для нової стратегії"""
+        """РОЗШИРЕНИЙ розрахунок індикаторів з об'ємом та волатільністю"""
         if len(df) < 50:
             return df
 
@@ -304,6 +410,41 @@ class AdvancedSignalGenerator:
             df['rsi_sma_trend_direction'] = np.where(df['rsi_sma_trend'] > 0, 1,
                                                      np.where(df['rsi_sma_trend'] < 0, -1, 0))
 
+            # НОВІ: Індикатори об'єму
+            if self.config.USE_VOLUME_CHECKS:
+                # Середній об'єм - використовуємо простий rolling mean
+                df['volume_sma'] = df['volume'].rolling(window=self.config.VOLUME_SMA_PERIOD).mean()
+
+                # Відношення поточного об'єму до середнього
+                df['volume_ratio'] = df['volume'] / df['volume_sma']
+
+                # Категорії об'єму
+                df['volume_category'] = np.where(
+                    df['volume_ratio'] >= self.config.HIGH_VOLUME_MULTIPLIER, 'high',
+                    np.where(df['volume_ratio'] >= self.config.MIN_VOLUME_MULTIPLIER, 'normal', 'low')
+                )
+
+            # НОВІ: Індикатори волатільності
+            if self.config.USE_VOLATILITY_CHECKS:
+                # Average True Range
+                atr_indicator = AverageTrueRange(
+                    high=df['high'], low=df['low'], close=df['close'],
+                    window=self.config.ATR_PERIOD
+                )
+                df['atr'] = atr_indicator.average_true_range()
+
+                # Середній ATR для порівняння
+                df['atr_sma'] = df['atr'].rolling(window=self.config.ATR_PERIOD).mean()
+
+                # Відношення поточної волатільності до середньої
+                df['volatility_ratio'] = df['atr'] / df['atr_sma']
+
+                # Категорії волатільності
+                df['volatility_category'] = np.where(
+                    df['volatility_ratio'] >= self.config.HIGH_VOLATILITY_MULTIPLIER, 'high',
+                    np.where(df['volatility_ratio'] >= self.config.MIN_VOLATILITY_MULTIPLIER, 'normal', 'low')
+                )
+
             # Підрахунок периодів тренду (для TREND_CANDLES перевірки)
             df['trend_periods_up'] = 0
             df['trend_periods_down'] = 0
@@ -312,13 +453,13 @@ class AdvancedSignalGenerator:
                 # Перевіряєм останні TREND_CANDLES періодів
                 recent_trends = df['rsi_sma_trend_direction'].iloc[i - self.config.TREND_CANDLES + 1:i + 1]
 
-                if all(trend >= 0 for trend in recent_trends):  # Висхідний або нейтральный тренд
+                if all(trend >= 0 for trend in recent_trends):  # Висхідний або нейтральний тренд
                     df.loc[i, 'trend_periods_up'] = self.config.TREND_CANDLES
 
-                if all(trend <= 0 for trend in recent_trends):  # Нисхідниий чи нейтральный тренд
+                if all(trend <= 0 for trend in recent_trends):  # Нисхідний чи нейтральний тренд
                     df.loc[i, 'trend_periods_down'] = self.config.TREND_CANDLES
 
-            # Болінджер бенди (опціонально)
+            # Болінгер бенди (опціонально)
             if self.config.USE_BOLLINGER:
                 bb = BollingerBands(close=df['close'], window=self.config.BOLLINGER_PERIOD,
                                     window_dev=self.config.BOLLINGER_STD)
@@ -330,6 +471,202 @@ class AdvancedSignalGenerator:
             self.logger.error(f"Помилка розрахунку індикаторів: {e}")
 
         return df
+
+    def analyze_volume(self, current_row: pd.Series) -> VolumeAnalysis:
+        """Аналіз об'єму для поточної свічки"""
+        try:
+            if not self.config.USE_VOLUME_CHECKS:
+                return VolumeAnalysis(0, 0, 1.0, True, 0, "disabled")
+
+            current_volume = current_row.get('volume', 0)
+            avg_volume = current_row.get('volume_sma', current_volume)
+
+            if avg_volume == 0:
+                volume_ratio = 1.0
+            else:
+                volume_ratio = current_volume / avg_volume
+
+            is_above_average = volume_ratio >= self.config.MIN_VOLUME_MULTIPLIER
+
+            # Розрахунок скору об'єму
+            if volume_ratio >= self.config.HIGH_VOLUME_MULTIPLIER * 1.5:
+                volume_score = self.config.SCORING_SYSTEM['very_high_volume']
+                volume_quality = "Very High"
+            elif volume_ratio >= self.config.HIGH_VOLUME_MULTIPLIER:
+                volume_score = self.config.SCORING_SYSTEM['high_volume']
+                volume_quality = "High"
+            elif volume_ratio >= self.config.MIN_VOLUME_MULTIPLIER:
+                volume_score = self.config.SCORING_SYSTEM['normal_volume']
+                volume_quality = "Normal"
+            else:
+                volume_score = self.config.SCORING_SYSTEM['low_volume']
+                volume_quality = "Low"
+
+            return VolumeAnalysis(
+                current_volume=current_volume,
+                avg_volume=avg_volume,
+                volume_ratio=volume_ratio,
+                is_above_average=is_above_average,
+                volume_score=volume_score,
+                volume_quality=volume_quality
+            )
+
+        except Exception as e:
+            self.logger.error(f"Помилка аналізу об'єму: {e}")
+            return VolumeAnalysis(0, 0, 1.0, True, 0, "error")
+
+    def analyze_volatility(self, current_row: pd.Series) -> VolatilityAnalysis:
+        """Аналіз волатільності для поточної свічки"""
+        try:
+            if not self.config.USE_VOLATILITY_CHECKS:
+                return VolatilityAnalysis(0, 0, 1.0, True, 0, "disabled")
+
+            current_atr = current_row.get('atr', 0)
+            avg_atr = current_row.get('atr_sma', current_atr)
+
+            if avg_atr == 0:
+                volatility_ratio = 1.0
+            else:
+                volatility_ratio = current_atr / avg_atr
+
+            is_adequate = volatility_ratio >= self.config.MIN_VOLATILITY_MULTIPLIER
+
+            # Розрахунок скору волатільності
+            if self.config.MIN_VOLATILITY_MULTIPLIER <= volatility_ratio <= self.config.HIGH_VOLATILITY_MULTIPLIER:
+                volatility_score = self.config.SCORING_SYSTEM['optimal_volatility']
+                volatility_quality = "Optimal"
+            elif volatility_ratio >= self.config.HIGH_VOLATILITY_MULTIPLIER:
+                volatility_score = self.config.SCORING_SYSTEM['high_volatility']
+                volatility_quality = "High"
+            elif volatility_ratio >= self.config.MIN_VOLATILITY_MULTIPLIER:
+                volatility_score = self.config.SCORING_SYSTEM['normal_volatility']
+                volatility_quality = "Normal"
+            else:
+                volatility_score = self.config.SCORING_SYSTEM['low_volatility']
+                volatility_quality = "Low"
+
+            return VolatilityAnalysis(
+                current_atr=current_atr,
+                avg_atr=avg_atr,
+                volatility_ratio=volatility_ratio,
+                is_adequate=is_adequate,
+                volatility_score=volatility_score,
+                volatility_quality=volatility_quality
+            )
+
+        except Exception as e:
+            self.logger.error(f"Помилка аналізу волатільності: {e}")
+            return VolatilityAnalysis(0, 0, 1.0, True, 0, "error")
+
+    def calculate_signal_score(self,
+                               primary_passed: List[CheckResult],
+                               primary_failed: List[CheckResult],
+                               confirmation_passed: List[CheckResult],
+                               confirmation_failed: List[CheckResult],
+                               volume_analysis: VolumeAnalysis,
+                               volatility_analysis: VolatilityAnalysis,
+                               current_primary: pd.Series,
+                               current_confirmation: pd.Series,
+                               direction: str) -> SignalScore:
+        """Розрахунок детального скору сигналу"""
+        try:
+            # Базовий скор
+            base_score = self.config.SCORING_SYSTEM['base_score']
+
+            # Технічний скор
+            technical_score = 0.0
+
+            # Бали за успішні перевірки
+            for check in primary_passed:
+                technical_score += self.config.SCORING_SYSTEM['primary_check_passed']
+
+            for check in confirmation_passed:
+                technical_score += self.config.SCORING_SYSTEM['confirmation_check_passed']
+
+            # Штрафи за невдалі перевірки
+            for check in primary_failed:
+                technical_score += self.config.SCORING_SYSTEM['primary_check_failed']
+
+            for check in confirmation_failed:
+                technical_score += self.config.SCORING_SYSTEM['confirmation_check_failed']
+
+            # Бонуси за якість сигналу
+            bonus_score = 0.0
+
+            # Бонус за ідеальний перетин RSI/SMA
+            rsi_cross_quality = abs(current_primary.get('rsi', 0) - current_primary.get('rsi_sma', 0))
+            if rsi_cross_quality >= 3.0:
+                bonus_score += self.config.SCORING_SYSTEM['perfect_rsi_cross']
+
+            # Бонус за сильну різницю на підтвердженні
+            confirmation_diff = abs(current_confirmation.get('rsi_diff', 0))
+            if confirmation_diff >= self.config.MIN_DIFF * 1.5:
+                bonus_score += self.config.SCORING_SYSTEM['strong_diff']
+
+            # Бонус за трендове вирівнювання
+            rsi_trend = current_confirmation.get('rsi_sma_trend', 0)
+            if direction == "Long" and rsi_trend >= 0:
+                bonus_score += self.config.SCORING_SYSTEM['trend_alignment']
+            elif direction == "Short" and rsi_trend <= 0:
+                bonus_score += self.config.SCORING_SYSTEM['trend_alignment']
+
+            # Скор об'єму та волатільності
+            volume_score = volume_analysis.volume_score
+            volatility_score = volatility_analysis.volatility_score
+
+            # Штрафи
+            penalty_score = 0.0
+            if not volume_analysis.is_above_average:
+                penalty_score += self.config.SCORING_SYSTEM['weak_signal']
+            if not volatility_analysis.is_adequate:
+                penalty_score += self.config.SCORING_SYSTEM['weak_signal']
+
+            # Загальний скор
+            total_score = (base_score + technical_score + bonus_score +
+                           volume_score + volatility_score + penalty_score)
+
+            # Максимально можливий скор (для розрахунку відсотка)
+            max_possible_score = (base_score +
+                                  len(primary_passed) * self.config.SCORING_SYSTEM['primary_check_passed'] +
+                                  len(confirmation_passed) * self.config.SCORING_SYSTEM['confirmation_check_passed'] +
+                                  self.config.SCORING_SYSTEM['perfect_rsi_cross'] +
+                                  self.config.SCORING_SYSTEM['strong_diff'] +
+                                  self.config.SCORING_SYSTEM['trend_alignment'] +
+                                  self.config.SCORING_SYSTEM['very_high_volume'] +
+                                  self.config.SCORING_SYSTEM['optimal_volatility'])
+
+            # Відсоток від максимального скору
+            score_percentage = min(100.0, max(0.0, (total_score / max_possible_score) * 100.0))
+
+            return SignalScore(
+                base_score=base_score,
+                technical_score=technical_score,
+                volume_score=volume_score,
+                volatility_score=volatility_score,
+                bonus_score=bonus_score,
+                penalty_score=penalty_score,
+                total_score=total_score,
+                max_possible_score=max_possible_score,
+                score_percentage=score_percentage
+            )
+
+        except Exception as e:
+            self.logger.error(f"Помилка розрахунку скору: {e}")
+            # Повертаємо мінімальний скор у разі помилки
+            return SignalScore(50.0, 0.0, 0.0, 0.0, 0.0, 0.0, 50.0, 100.0, 50.0)
+
+    def determine_quality_from_score(self, total_score: float) -> SignalQuality:
+        """Визначення якості сигналу на основі скору"""
+        if total_score >= 85:
+            return SignalQuality.EXCELLENT
+        elif total_score >= 70:
+            return SignalQuality.HIGH
+        elif total_score >= 55:
+            return SignalQuality.MEDIUM
+        elif total_score >= 40:
+            return SignalQuality.LOW
+        else:
+            return SignalQuality.POOR
 
     def check_advanced_rsi_signal(self, df_primary: pd.DataFrame, df_confirmation: pd.DataFrame,
                                   idx_primary: int, symbol: str) -> Tuple[
@@ -344,7 +681,7 @@ class AdvancedSignalGenerator:
         current_primary = df_primary.iloc[idx_primary]
         previous_primary = df_primary.iloc[idx_primary - 1]
 
-        # Знаходимо відповідну свічку на таймреймі для підтвердження
+        # Знаходимо відповідну свічку на таймфреймі для підтвердження
         current_time = current_primary['datetime']
         df_confirmation_filtered = df_confirmation[df_confirmation['datetime'] <= current_time]
 
@@ -405,6 +742,9 @@ class AdvancedSignalGenerator:
                         short_confirmation_passed, short_confirmation_failed, SignalStatus.SKIP,
                         skip_reason if skip_reason else "Не всі умови підтвердження виконані")
 
+        # Якщо жоден з сигналів не підтвердився
+        return None, [], [], [], [], SignalStatus.SKIP, "No valid signal conditions"
+
     def check_long_conditions_primary_detailed(self, current_primary: pd.Series, previous_primary: pd.Series,
                                                symbol: str) -> \
             Tuple[List[CheckResult], List[CheckResult]]:
@@ -420,14 +760,14 @@ class AdvancedSignalGenerator:
             name="RSI Cross SMA Up",
             passed=rsi_cross_up,
             value=f"Prev: RSI={previous_primary['rsi']:.2f} vs SMA={previous_primary['rsi_sma']:.2f}, Curr: RSI={current_primary['rsi']:.2f} vs SMA={current_primary['rsi_sma']:.2f}",
-            description="RSI перетинає SMA знизу вверх"
+            description="RSI перетинає SMA знизу вверх",
+            score_impact=15.0 if rsi_cross_up else -10.0
         )
 
         if rsi_cross_up:
             passed.append(check)
         else:
             failed.append(check)
-            # ВИПРАВЛЕНО: НЕ повертаємо тут, а продовжуємо перевірку всіх умов
 
         # 2. Зглажений RSI < LONG_ENTRY_MAX_RSI
         rsi_in_zone = previous_primary['rsi_sma'] < self.config.LONG_ENTRY_MAX_RSI
@@ -436,14 +776,14 @@ class AdvancedSignalGenerator:
             name="RSI Entry Zone",
             passed=rsi_in_zone,
             value=f"RSI_SMA={previous_primary['rsi_sma']:.2f} < {self.config.LONG_ENTRY_MAX_RSI}",
-            description=f"RSI нижче рівня входу {self.config.LONG_ENTRY_MAX_RSI}"
+            description=f"RSI нижче рівня входу {self.config.LONG_ENTRY_MAX_RSI}",
+            score_impact=15.0 if rsi_in_zone else -10.0
         )
 
         if rsi_in_zone:
             passed.append(check)
         else:
             failed.append(check)
-            # ВИПРАВЛЕНО: НЕ повертаємо тут, а продовжуємо перевірку всіх умов
 
         # 3. Делей: остання ПІДТВЕРДЖЕНА LONG позиція закрита мінімум DELAY_CANDLES тому
         delay_ok = self.check_confirmed_position_delay(symbol, "Long", current_primary['datetime'])
@@ -452,7 +792,66 @@ class AdvancedSignalGenerator:
             name="Position Delay",
             passed=delay_ok,
             value=f"Delay >= {self.config.DELAY_CANDLES} candles",
-            description=f"Мінімум {self.config.DELAY_CANDLES} свічок після останньої підтвердженої Long позиції"
+            description=f"Мінімум {self.config.DELAY_CANDLES} свічок після останньої підтвердженої Long позиції",
+            score_impact=15.0 if delay_ok else -10.0
+        )
+
+        if delay_ok:
+            passed.append(check)
+        else:
+            failed.append(check)
+
+        return passed, failed
+
+    def check_short_conditions_primary_detailed(self, current_primary: pd.Series, previous_primary: pd.Series,
+                                                symbol: str) -> \
+            Tuple[List[CheckResult], List[CheckResult]]:
+        """Детальна перевірка умов SHORT на первинному таймфреймі"""
+        passed = []
+        failed = []
+
+        # 1. Зглажений RSI перетинає RSI SMA зверху вниз
+        rsi_cross_down = (previous_primary['rsi'] >= previous_primary['rsi_sma'] and
+                          current_primary['rsi'] < current_primary['rsi_sma'])
+
+        check = CheckResult(
+            name="RSI Cross SMA Down",
+            passed=rsi_cross_down,
+            value=f"Prev: RSI={previous_primary['rsi']:.2f} vs SMA={previous_primary['rsi_sma']:.2f}, Curr: RSI={current_primary['rsi']:.2f} vs SMA={current_primary['rsi_sma']:.2f}",
+            description="RSI перетинає SMA зверху вниз",
+            score_impact=15.0 if rsi_cross_down else -10.0
+        )
+
+        if rsi_cross_down:
+            passed.append(check)
+        else:
+            failed.append(check)
+
+        # 2. Зглажений RSI > SHORT_ENTRY_MIN_RSI
+        rsi_in_zone = previous_primary['rsi_sma'] > self.config.SHORT_ENTRY_MIN_RSI
+
+        check = CheckResult(
+            name="RSI Entry Zone",
+            passed=rsi_in_zone,
+            value=f"RSI_SMA={previous_primary['rsi_sma']:.2f} > {self.config.SHORT_ENTRY_MIN_RSI}",
+            description=f"RSI вище рівня входу {self.config.SHORT_ENTRY_MIN_RSI}",
+            score_impact=15.0 if rsi_in_zone else -10.0
+        )
+
+        if rsi_in_zone:
+            passed.append(check)
+        else:
+            failed.append(check)
+
+        # 3. Делей: остання ПІДТВЕРДЖЕНА SHORT позиція закрита мінімум DELAY_CANDLES тому
+        delay_ok = self.check_confirmed_position_delay(symbol, "Short", current_primary['datetime'])
+
+        check = CheckResult(
+            name="Position Delay",
+            passed=delay_ok,
+            value=f"Delay >= {self.config.DELAY_CANDLES} candles",
+            description=f"Мінімум {self.config.DELAY_CANDLES} свічок після останньої підтвердженої Short позиції",
+            score_impact=15.0 if delay_ok else -10.0
         )
 
         if delay_ok:
@@ -478,15 +877,15 @@ class AdvancedSignalGenerator:
             name="SMA-RSI Difference",
             passed=diff_ok,
             value=f"SMA-RSI={rsi_sma_diff:.2f} >= {self.config.MIN_DIFF}",
-            description=f"Різниця SMA-RSI достатня для входу"
+            description=f"Різниця SMA-RSI достатня для входу",
+            score_impact=20.0 if diff_ok else -15.0
         )
 
         if diff_ok:
             passed.append(check)
         else:
             failed.append(check)
-            skip_reason = f"SMA-RSI різниця {rsi_sma_diff:.2f} < {self.config.MIN_DIFF}"
-            # ВИПРАВЛЕНО: НЕ повертаємо тут, а продовжуємо перевірку всіх умов
+            skip_reason = f"SMA-RSI diff {rsi_sma_diff:.2f} < {self.config.MIN_DIFF}"
 
         # 2. Якщо RSI > 50 - сигнал пропускається
         rsi_below_50 = current_confirmation['rsi'] <= 50
@@ -495,16 +894,16 @@ class AdvancedSignalGenerator:
             name="RSI Below 50",
             passed=rsi_below_50,
             value=f"RSI={current_confirmation['rsi']:.2f} <= 50",
-            description="RSI нижче нейтрального рівня 50"
+            description="RSI нижче нейтрального рівня 50",
+            score_impact=20.0 if rsi_below_50 else -15.0
         )
 
         if rsi_below_50:
             passed.append(check)
         else:
             failed.append(check)
-            if not skip_reason:  # якщо ще не встановлена причина
+            if not skip_reason:
                 skip_reason = f"RSI {current_confirmation['rsi']:.2f} > 50"
-            # ВИПРАВЛЕНО: НЕ повертаємо тут, а продовжуємо перевірку всіх умов
 
         # 3. Перевірка що SMA НЕ СПАДАЄ (критична для LONG)
         if len(df_confirmation) >= 2:
@@ -518,7 +917,8 @@ class AdvancedSignalGenerator:
                 name="SMA Not Falling",
                 passed=sma_not_falling,
                 value=f"SMA: {previous_confirmation['rsi_sma']:.2f} -> {current_confirmation['rsi_sma']:.2f}",
-                description="SMA не спадає"
+                description="SMA не спадає",
+                score_impact=20.0 if sma_not_falling else -15.0
             )
 
             if sma_not_falling:
@@ -527,7 +927,6 @@ class AdvancedSignalGenerator:
                 failed.append(check)
                 if not skip_reason:
                     skip_reason = "SMA спадає - не підходить для LONG"
-                # ВИПРАВЛЕНО: НЕ повертаємо тут, а продовжуємо перевірку всіх умов
 
         # 4. Перевірка тренду SMA за TREND_CANDLES періодів
         if len(df_confirmation) >= self.config.TREND_CANDLES:
@@ -541,13 +940,14 @@ class AdvancedSignalGenerator:
                             df_confirmation) else current_sma
                         recent_sma_changes.append(current_sma - prev_sma)
 
-            no_uptrend = (recent_sma_changes and all(change > 0 for change in recent_sma_changes))
-            no_uptrend = True # Тимчасвоо вимкнуто
+            no_uptrend = not (recent_sma_changes and all(change > 0 for change in recent_sma_changes))
+            no_uptrend = True  # Тимчасово вимкнуто
             check = CheckResult(
                 name="No SMA Uptrend",
                 passed=no_uptrend,
                 value=f"SMA changes: {[f'{change:.3f}' for change in recent_sma_changes]}",
-                description=f"Немає стійкого SMA тренду вгору за {self.config.TREND_CANDLES} періодів"
+                description=f"Немає стійкого SMA тренду вгору за {self.config.TREND_CANDLES} періодів",
+                score_impact=20.0 if no_uptrend else -15.0
             )
 
             if no_uptrend:
@@ -557,136 +957,7 @@ class AdvancedSignalGenerator:
                 if not skip_reason:
                     skip_reason = f"SMA тренд вгору за {self.config.TREND_CANDLES} періодів"
 
-        # Повертаємо результати всіх перевірок
         return passed, failed, skip_reason
-
-    def scan_dual_timeframe_signals(self, df_primary: pd.DataFrame, df_confirmation: pd.DataFrame,
-                                    pair: str, days_back: int) -> List[AdvancedMarketSignal]:
-        """Сканирование сигналов по двухтаймфреймовой стратегии с детальною інформацією"""
-        signals = []
-
-        if len(df_primary) < 50 or len(df_confirmation) < 10:
-            print(
-                f"⚠️ {pair}: Недостатньо даних ({self.config.PRIMARY_TIMEFRAME}: {len(df_primary)}, {self.config.CONFIRMATION_TIMEFRAME}: {len(df_confirmation)})")
-            return signals
-
-        end_time = datetime.now()
-        start_time = end_time - timedelta(days=days_back)
-
-        print(f"🔍 {pair}: Шукаєм сигнали з {start_time.strftime('%Y-%m-%d %H:%M')}")
-
-        # Фильтруем данные по периоду
-        df_primary_period = df_primary[df_primary['datetime'] >= start_time].copy()
-
-        if len(df_primary_period) < 10:
-            print(f"⚠️ {pair}: Недостатньо даних за період")
-            return signals
-
-        print(f"📊 {pair}: Аналізуємо {len(df_primary_period)} свічей {self.config.PRIMARY_TIMEFRAME}")
-
-        # Находим начальный индекс
-        start_idx = df_primary[df_primary['datetime'] >= start_time].index[0] if len(
-            df_primary[df_primary['datetime'] >= start_time]) > 0 else len(df_primary)
-        start_idx = max(20, start_idx)
-
-        for i in range(start_idx, len(df_primary) - 1):
-            current_row = df_primary.iloc[i]
-
-            if current_row['datetime'] < start_time or current_row['datetime'] > end_time:
-                continue
-
-            try:
-                # Проверка сигнала по новой детальной логике с обработкой ошибок
-                signal_result = self.check_advanced_rsi_signal(df_primary, df_confirmation, i, pair)
-
-                # ВИПРАВЛЕНО: Перевіряємо що результат не None і має правильну структуру
-                if signal_result is None or len(signal_result) != 7:
-                    continue
-
-                direction, primary_passed, primary_failed, confirmation_passed, confirmation_failed, status, skip_reason = signal_result
-
-                if not direction:
-                    continue
-
-                # Находим соответствующие данные на таймфрейме подтверждения
-                current_time = current_row['datetime']
-                df_confirmation_filtered = df_confirmation[df_confirmation['datetime'] <= current_time]
-                if len(df_confirmation_filtered) == 0:
-                    continue
-
-                current_confirmation = df_confirmation_filtered.iloc[-1]
-
-                # Расчет уверенности и качества
-                total_passed_checks = len(primary_passed) + len(confirmation_passed)
-                total_failed_checks = len(primary_failed) + len(confirmation_failed)
-
-                base_confidence = 50.0 if status == SignalStatus.SKIP else 70.0
-                confidence = min(95.0, base_confidence + total_passed_checks * 8.0 - total_failed_checks * 2.0)
-
-                if status == SignalStatus.OPEN:
-                    if confidence >= 80 and total_passed_checks >= 5:
-                        quality = SignalQuality.HIGH
-                    elif confidence >= 65 and total_passed_checks >= 3:
-                        quality = SignalQuality.MEDIUM
-                    else:
-                        quality = SignalQuality.LOW
-                else:
-                    quality = SignalQuality.LOW
-
-                # Расчет времени и цены входа
-                entry_time, entry_price = self.calculate_entry_time_and_price_advanced(
-                    df_primary, i, current_row['datetime']
-                )
-
-                # Регистрируем ТОЛЬКО ПОДТВЕРЖДЕННЫЕ позиции для делея
-                if status == SignalStatus.OPEN:
-                    self.register_confirmed_position(pair, direction, current_row['datetime'])
-
-                # Создание сигнала с детальной информацией
-                signal = AdvancedMarketSignal(
-                    pair=pair,
-                    direction=direction,
-                    signal_time=current_row['datetime'],
-                    entry_time=entry_time,
-
-                    # RSI данные основного таймфрейма
-                    rsi_1m=current_row.get('rsi', 0),
-                    rsi_sma_1m=current_row.get('rsi_sma', 0),
-                    rsi_diff_1m=current_row.get('rsi_diff', 0),
-
-                    # RSI данные таймфрейма подтверждения
-                    rsi_5m=current_confirmation.get('rsi', 0),
-                    rsi_sma_5m=current_confirmation.get('rsi_sma', 0),
-                    rsi_diff_5m=current_confirmation.get('rsi_diff', 0),
-                    avg_diff_5m=current_confirmation.get('avg_diff', 0),
-
-                    signal_price=current_row['close'],
-                    entry_price=entry_price,
-                    quality=quality,
-                    confidence_score=confidence,
-                    status=status,
-
-                    # Детальна інформація про перевірки
-                    primary_checks_passed=primary_passed,
-                    primary_checks_failed=primary_failed,
-                    confirmation_checks_passed=confirmation_passed,
-                    confirmation_checks_failed=confirmation_failed,
-
-                    skip_reason=skip_reason,
-                    comment=f"{self.config.PRIMARY_TIMEFRAME} cross, {self.config.CONFIRMATION_TIMEFRAME} {'confirmed' if status == SignalStatus.OPEN else 'rejected'}"
-                )
-
-                signals.append(signal)
-
-                # Виводимо детальну інформацію про кожен сигнал
-                self.print_detailed_signal_info(signal)
-
-            except Exception as e:
-                # ВИПРАВЛЕНО: Додаємо обробку помилок для кожної ітерації
-                self.logger.error(f"Помилка обробки свічки {i} для {pair}: {e}")
-                continue
-
-        return signals
 
     def check_short_conditions_confirmation_detailed(self, df_confirmation: pd.DataFrame,
                                                      current_confirmation: pd.Series) -> \
@@ -704,7 +975,8 @@ class AdvancedSignalGenerator:
             name="RSI-SMA Difference",
             passed=diff_ok,
             value=f"RSI-SMA={rsi_sma_diff:.2f} >= {self.config.MIN_DIFF}",
-            description=f"The RSI-SMA difference isn`t enough for the entry"
+            description=f"Різниця RSI-SMA достатня для входу",
+            score_impact=20.0 if diff_ok else -15.0
         )
 
         if diff_ok:
@@ -712,7 +984,6 @@ class AdvancedSignalGenerator:
         else:
             failed.append(check)
             skip_reason = f"RSI-SMA різниця {rsi_sma_diff:.2f} < {self.config.MIN_DIFF}"
-            # ВИПРАВЛЕНО: НЕ повертаємо тут, а продовжуємо перевірку всіх умов
 
         # 2. RSI > 50
         rsi_above_50 = current_confirmation['rsi'] >= 50
@@ -721,7 +992,8 @@ class AdvancedSignalGenerator:
             name="RSI Above 50",
             passed=rsi_above_50,
             value=f"RSI={current_confirmation['rsi']:.2f} >= 50",
-            description="RSI вище нейтрального рівня 50"
+            description="RSI вище нейтрального рівня 50",
+            score_impact=20.0 if rsi_above_50 else -15.0
         )
 
         if rsi_above_50:
@@ -730,7 +1002,6 @@ class AdvancedSignalGenerator:
             failed.append(check)
             if not skip_reason:
                 skip_reason = f"RSI {current_confirmation['rsi']:.2f} < 50"
-            # ВИПРАВЛЕНО: НЕ повертаємо тут, а продовжуємо перевірку всіх умов
 
         # 3. Перевірка що SMA НЕ ЗРОСТАЄ (критична для SHORT)
         if len(df_confirmation) >= 2:
@@ -744,7 +1015,8 @@ class AdvancedSignalGenerator:
                 name="SMA Not Increasing",
                 passed=sma_not_increasing,
                 value=f"SMA: {previous_confirmation['rsi_sma']:.2f} -> {current_confirmation['rsi_sma']:.2f}",
-                description="SMA не зростає"
+                description="SMA не зростає",
+                score_impact=20.0 if sma_not_increasing else -15.0
             )
 
             if sma_not_increasing:
@@ -753,7 +1025,6 @@ class AdvancedSignalGenerator:
                 failed.append(check)
                 if not skip_reason:
                     skip_reason = "SMA зростає - не підходить для SHORT"
-                # ВИПРАВЛЕНО: НЕ повертаємо тут, а продовжуємо перевірку всіх умов
 
         # 4. Перевірка тренду SMA за TREND_CANDLES періодів
         if len(df_confirmation) >= self.config.TREND_CANDLES:
@@ -767,14 +1038,14 @@ class AdvancedSignalGenerator:
                             df_confirmation) else current_sma
                         recent_sma_changes.append(current_sma - prev_sma)
 
-            no_downtrend =  (recent_sma_changes and all(change < 0 for change in recent_sma_changes))
-
-            no_downtrend = True # Тимчасово вимкнуто
+            no_downtrend = not (recent_sma_changes and all(change < 0 for change in recent_sma_changes))
+            no_downtrend = True  # Тимчасово вимкнуто
             check = CheckResult(
                 name="No SMA Downtrend",
                 passed=no_downtrend,
                 value=f"SMA changes: {[f'{change:.3f}' for change in recent_sma_changes]}",
-                description=f"Немає стійкого SMA тренду вниз за {self.config.TREND_CANDLES} періодів"
+                description=f"Немає стійкого SMA тренду вниз за {self.config.TREND_CANDLES} періодів",
+                score_impact=20.0 if no_downtrend else -15.0
             )
 
             if no_downtrend:
@@ -784,65 +1055,7 @@ class AdvancedSignalGenerator:
                 if not skip_reason:
                     skip_reason = f"SMA тренд вниз за {self.config.TREND_CANDLES} періодів"
 
-        # Повертаємо результати всіх перевірок
         return passed, failed, skip_reason
-
-    def check_short_conditions_primary_detailed(self, current_primary: pd.Series, previous_primary: pd.Series,
-                                                symbol: str) -> \
-            Tuple[List[CheckResult], List[CheckResult]]:
-        """Детальна перевірка умов SHORT на первинному таймфреймі"""
-        passed = []
-        failed = []
-
-        # 1. Зглажений RSI перетинає RSI SMA зверху вниз
-        rsi_cross_down = (previous_primary['rsi'] >= previous_primary['rsi_sma'] and
-                          current_primary['rsi'] < current_primary['rsi_sma'])
-
-        check = CheckResult(
-            name="RSI Cross SMA Down",
-            passed=rsi_cross_down,
-            value=f"Prev: RSI={previous_primary['rsi']:.2f} vs SMA={previous_primary['rsi_sma']:.2f}, Curr: RSI={current_primary['rsi']:.2f} vs SMA={current_primary['rsi_sma']:.2f}",
-            description="RSI перетинає SMA зверху вниз"
-        )
-
-        if rsi_cross_down:
-            passed.append(check)
-        else:
-            failed.append(check)
-            # ВИПРАВЛЕНО: НЕ повертаємо тут, а продовжуємо перевірку всіх умов
-
-        # 2. Зглажений RSI > SHORT_ENTRY_MIN_RSI
-        rsi_in_zone = previous_primary['rsi_sma'] > self.config.SHORT_ENTRY_MIN_RSI
-
-        check = CheckResult(
-            name="RSI Entry Zone",
-            passed=rsi_in_zone,
-            value=f"RSI_SMA={previous_primary['rsi_sma']:.2f} > {self.config.SHORT_ENTRY_MIN_RSI}",
-            description=f"RSI вище рівня входу {self.config.SHORT_ENTRY_MIN_RSI}"
-        )
-
-        if rsi_in_zone:
-            passed.append(check)
-        else:
-            failed.append(check)
-            # ВИПРАВЛЕНО: НЕ повертаємо тут, а продовжуємо перевірку всіх умов
-
-        # 3. Делей: остання ПІДТВЕРДЖЕНА SHORT позиція закрита мінімум DELAY_CANDLES тому
-        delay_ok = self.check_confirmed_position_delay(symbol, "Short", current_primary['datetime'])
-
-        check = CheckResult(
-            name="Position Delay",
-            passed=delay_ok,
-            value=f"Delay >= {self.config.DELAY_CANDLES} candles",
-            description=f"Мінімум {self.config.DELAY_CANDLES} свічок після останньої підтвердженої Short позиції"
-        )
-
-        if delay_ok:
-            passed.append(check)
-        else:
-            failed.append(check)
-
-        return passed, failed
 
     def check_confirmed_position_delay(self, symbol: str, direction: str, current_time: datetime) -> bool:
         """Перевірка делею між ПІДТВЕРДЖЕНИМИ позиціями"""
@@ -875,35 +1088,6 @@ class AdvancedSignalGenerator:
             if pos_time > cutoff_time
         ]
 
-    def check_exit_conditions(self, df_confirmation: pd.DataFrame, direction: str, current_confirmation: pd.Series) -> \
-            Tuple[bool, str]:
-        """Перевірка умов закриття позиції"""
-        if direction == "Long":
-            # Закриття за умови досягнення RSI зони PREBOUGHT_LEVEL на таймфреймі підтвердження
-            if current_confirmation['rsi'] >= self.config.PREBOUGHT_LEVEL:
-                return True, f"RSI >= {self.config.PREBOUGHT_LEVEL}"
-
-            # Закриття за умови перетину rsi sma вниз на таймфреймі підтвердження
-            if len(df_confirmation) >= 2:
-                previous_confirmation = df_confirmation.iloc[-2]
-                if (previous_confirmation['rsi'] >= previous_confirmation['rsi_sma'] and
-                        current_confirmation['rsi'] < current_confirmation['rsi_sma']):
-                    return True, "RSI перетнув SMA вниз"
-
-        elif direction == "Short":
-            # Закриття за умови досягнення RSI зони PREOVERSOLD_LEVEL на таймфреймі підтвердження
-            if current_confirmation['rsi'] <= self.config.PREOVERSOLD_LEVEL:
-                return True, f"RSI <= {self.config.PREOVERSOLD_LEVEL}"
-
-            # Закриття за умови перетину rsi sma вгору на таймфреймі підтвердження
-            if len(df_confirmation) >= 2:
-                previous_confirmation = df_confirmation.iloc[-2]
-                if (previous_confirmation['rsi'] <= previous_confirmation['rsi_sma'] and
-                        current_confirmation['rsi'] > current_confirmation['rsi_sma']):
-                    return True, "RSI перетнув SMA вгору"
-
-        return False, ""
-
     def calculate_entry_time_and_price_advanced(self, df_primary: pd.DataFrame, signal_idx: int,
                                                 signal_time: datetime) -> Tuple[datetime, float]:
         """Розрахунок часу та ціни входу для нової стратегії"""
@@ -926,16 +1110,168 @@ class AdvancedSignalGenerator:
             entry_price = df_primary.iloc[signal_idx]['close']
             return entry_time, entry_price
 
+    def scan_dual_timeframe_signals(self, df_primary: pd.DataFrame, df_confirmation: pd.DataFrame,
+                                    pair: str) -> List[AdvancedMarketSignal]:
+        """ОНОВЛЕНЕ сканування сигналів з гнучким періодом та покращеним скорингом"""
+        signals = []
+
+        if len(df_primary) < 50 or len(df_confirmation) < 10:
+            print(
+                f"⚠️ {pair}: Недостатньо даних ({self.config.PRIMARY_TIMEFRAME}: {len(df_primary)}, {self.config.CONFIRMATION_TIMEFRAME}: {len(df_confirmation)})")
+            return signals
+
+        # НОВИЙ: Використовуємо гнучкий період для сигналів
+        end_time = datetime.now()
+        start_time = end_time - self.get_signal_period_timedelta()
+
+        print(f"🔍 {pair}: Шукаємо сигнали з {start_time.strftime('%Y-%m-%d %H:%M')} "
+              f"(період: {self.config.SIGNAL_PERIOD_DAYS}д {self.config.SIGNAL_PERIOD_HOURS}г)")
+
+        # Фільтруємо дані по періоду
+        df_primary_period = df_primary[df_primary['datetime'] >= start_time].copy()
+
+        if len(df_primary_period) < 10:
+            print(f"⚠️ {pair}: Недостатньо даних за період")
+            return signals
+
+        print(f"📊 {pair}: Аналізуємо {len(df_primary_period)} свічей {self.config.PRIMARY_TIMEFRAME}")
+
+        # Знаходимо початковий індекс
+        start_idx = df_primary[df_primary['datetime'] >= start_time].index[0] if len(
+            df_primary[df_primary['datetime'] >= start_time]) > 0 else len(df_primary)
+        start_idx = max(20, start_idx)
+
+        for i in range(start_idx, len(df_primary) - 1):
+            current_row = df_primary.iloc[i]
+
+            if current_row['datetime'] < start_time or current_row['datetime'] > end_time:
+                continue
+
+            try:
+                # Проверка сигнала по новой детальной логике
+                signal_result = self.check_advanced_rsi_signal(df_primary, df_confirmation, i, pair)
+
+                if signal_result is None or len(signal_result) != 7:
+                    continue
+
+                direction, primary_passed, primary_failed, confirmation_passed, confirmation_failed, status, skip_reason = signal_result
+
+                if not direction:
+                    continue
+
+                # Знаходимо відповідні дані на таймфреймі підтвердження
+                current_time = current_row['datetime']
+                df_confirmation_filtered = df_confirmation[df_confirmation['datetime'] <= current_time]
+                if len(df_confirmation_filtered) == 0:
+                    continue
+
+                current_confirmation = df_confirmation_filtered.iloc[-1]
+
+                # НОВИЙ: Аналіз об'єму та волатільності
+                volume_analysis = self.analyze_volume(current_confirmation)
+                volatility_analysis = self.analyze_volatility(current_confirmation)
+
+                # НОВИЙ: Розрахунок детального скору
+                signal_score = self.calculate_signal_score(
+                    primary_passed, primary_failed,
+                    confirmation_passed, confirmation_failed,
+                    volume_analysis, volatility_analysis,
+                    current_row, current_confirmation, direction
+                )
+
+                # Визначення якості на основі скору
+                quality = self.determine_quality_from_score(signal_score.total_score)
+
+                # ОНОВЛЕНО: confidence_score тепер синхронізований з total_score
+                confidence = min(100.0, max(0.0, signal_score.total_score))
+
+                # Розрахунок часу та ціни входу
+                entry_time, entry_price = self.calculate_entry_time_and_price_advanced(
+                    df_primary, i, current_row['datetime']
+                )
+
+                # Реєструємо ТІЛЬКИ ПІДТВЕРДЖЕНІ позиції для делею
+                if status == SignalStatus.OPEN:
+                    self.register_confirmed_position(pair, direction, current_row['datetime'])
+
+                # Створення сигналу з НОВИМИ даними
+                signal = AdvancedMarketSignal(
+                    pair=pair,
+                    direction=direction,
+                    signal_time=current_row['datetime'],
+                    entry_time=entry_time,
+
+                    # RSI дані основного таймфрейму
+                    rsi_1m=current_row.get('rsi', 0),
+                    rsi_sma_1m=current_row.get('rsi_sma', 0),
+                    rsi_diff_1m=current_row.get('rsi_diff', 0),
+
+                    # RSI дані таймфрейму підтвердження
+                    rsi_5m=current_confirmation.get('rsi', 0),
+                    rsi_sma_5m=current_confirmation.get('rsi_sma', 0),
+                    rsi_diff_5m=current_confirmation.get('rsi_diff', 0),
+                    avg_diff_5m=current_confirmation.get('avg_diff', 0),
+
+                    signal_price=current_row['close'],
+                    entry_price=entry_price,
+                    quality=quality,
+                    confidence_score=confidence,
+                    status=status,
+
+                    # НОВІ: Аналіз об'єму та волатільності
+                    volume_analysis=volume_analysis,
+                    volatility_analysis=volatility_analysis,
+                    signal_score=signal_score,
+
+                    # Детальна інформація про перевірки
+                    primary_checks_passed=primary_passed,
+                    primary_checks_failed=primary_failed,
+                    confirmation_checks_passed=confirmation_passed,
+                    confirmation_checks_failed=confirmation_failed,
+
+                    skip_reason=skip_reason,
+                    comment=f"{self.config.PRIMARY_TIMEFRAME} cross, {self.config.CONFIRMATION_TIMEFRAME} {'confirmed' if status == SignalStatus.OPEN else 'rejected'}"
+                )
+
+                signals.append(signal)
+
+                # Виводимо детальну інформацію про кожен сигнал
+                self.print_detailed_signal_info(signal)
+
+            except Exception as e:
+                # Додаємо обробку помилок для кожної ітерації
+                self.logger.error(f"Помилка обробки свічки {i} для {pair}: {e}")
+                continue
+
+        return signals
+
     def print_detailed_signal_info(self, signal: AdvancedMarketSignal):
-        """Виведення детальної інформації про сигнал"""
+        """ОНОВЛЕНИЙ виведення детальної інформації про сигнал з новими даними"""
         status_emoji = "✅" if signal.status == SignalStatus.OPEN else "⏭️"
 
         print(f"\n{status_emoji} {signal.pair} {signal.direction} - {signal.signal_time.strftime('%Y-%m-%d %H:%M')}")
-        print(
-            f"   Статус: {signal.status.value} | Впевненість: {signal.confidence_score:.1f}% | Якість: {signal.quality.value}")
+        print(f"   Статус: {signal.status.value} | Скор: {signal.signal_score.total_score:.1f} | "
+              f"Впевненість: {signal.confidence_score:.1f}% | Якість: {signal.quality.value}")
 
         if signal.status == SignalStatus.SKIP:
             print(f"   💡 Причина пропуску: {signal.skip_reason}")
+
+        # НОВИЙ: Інформація про об'єм та волатільність
+        if signal.volume_analysis.volume_quality != "disabled":
+            print(f"   📊 Об'єм: {signal.volume_analysis.volume_quality} "
+                  f"(ratio: {signal.volume_analysis.volume_ratio:.2f}, score: {signal.volume_analysis.volume_score:+.1f})")
+
+        if signal.volatility_analysis.volatility_quality != "disabled":
+            print(f"   📈 Волатільність: {signal.volatility_analysis.volatility_quality} "
+                  f"(ratio: {signal.volatility_analysis.volatility_ratio:.2f}, score: {signal.volatility_analysis.volatility_score:+.1f})")
+
+        # НОВИЙ: Детальний розклад скору
+        print(f"   🎯 Скор: Base={signal.signal_score.base_score:.1f} | "
+              f"Technical={signal.signal_score.technical_score:+.1f} | "
+              f"Volume={signal.signal_score.volume_score:+.1f} | "
+              f"Volatility={signal.signal_score.volatility_score:+.1f} | "
+              f"Bonus={signal.signal_score.bonus_score:+.1f} | "
+              f"Penalty={signal.signal_score.penalty_score:+.1f}")
 
         # Перевірки первинного таймфрейму
         if signal.primary_checks_passed or signal.primary_checks_failed:
@@ -972,11 +1308,13 @@ class AdvancedSignalGenerator:
         print(
             f"      {self.config.CONFIRMATION_TIMEFRAME}: RSI={signal.rsi_5m:.2f}, SMA={signal.rsi_sma_5m:.2f}, Diff={signal.rsi_diff_5m:.2f}")
 
-
-    async def analyze_pair_advanced(self, pair: str, days_back: int = 7) -> List[AdvancedMarketSignal]:
-        """Аналіз пари з новою стратегією"""
+    async def analyze_pair_advanced(self, pair: str) -> List[AdvancedMarketSignal]:
+        """ОНОВЛЕНИЙ аналіз пари з новою системою скорингу"""
         try:
             print(f"\n🔍 Аналізуємо {pair}...")
+
+            # Розраховуємо необхідні дні для завантаження даних (більше ніж період сигналів для індикаторів)
+            days_back = max(self.get_signal_period_days(), 7)
 
             # Завантажуємо дані для двох таймфреймів
             df_primary, df_confirmation = await self.fetch_dual_timeframe_data(pair, days_back)
@@ -993,14 +1331,18 @@ class AdvancedSignalGenerator:
             self.market_data_1m[pair] = df_primary
             self.market_data_5m[pair] = df_confirmation
 
-            # Сканируем сигналы
-            signals = self.scan_dual_timeframe_signals(df_primary, df_confirmation, pair, days_back)
+            # Скануємо сигнали
+            signals = self.scan_dual_timeframe_signals(df_primary, df_confirmation, pair)
 
             print(f"\n📊 {pair}: Знайдено {len(signals)} сигналів")
             open_signals = [s for s in signals if s.status == SignalStatus.OPEN]
             skip_signals = [s for s in signals if s.status == SignalStatus.SKIP]
             print(f"   ✅ Підтверджених: {len(open_signals)}")
             print(f"   ⏭️ Пропущених: {len(skip_signals)}")
+
+            if open_signals:
+                avg_score = sum(s.signal_score.total_score for s in open_signals) / len(open_signals)
+                print(f"   🎯 Середній скор підтверджених: {avg_score:.1f}")
 
             return signals
 
@@ -1009,20 +1351,20 @@ class AdvancedSignalGenerator:
             return []
 
     def save_signals_to_csv(self, all_signals: List[AdvancedMarketSignal], filename: str = None):
-        """Збереження сигналів у CSV з детальною інформацією"""
+        """ОНОВЛЕНЕ збереження сигналів у CSV з новими даними"""
         if not all_signals:
             print("📄 Немає сигналів для збереження")
             return
 
         if filename is None:
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            filename = f"detailed_signals_{timestamp}.csv"
+            filename = f"advanced_signals_v23_{timestamp}.csv"
 
         try:
             with open(filename, 'w', newline='', encoding='utf-8') as file:
                 writer = csv.writer(file, delimiter=";")
 
-                # Заголовки
+                # ОНОВЛЕНІ заголовки з новими полями
                 headers = [
                     'Pair', 'Direction', 'Status', 'Signal_Time', 'Entry_Time',
                     f'RSI_{self.config.PRIMARY_TIMEFRAME}', f'RSI_SMA_{self.config.PRIMARY_TIMEFRAME}',
@@ -1030,6 +1372,17 @@ class AdvancedSignalGenerator:
                     f'RSI_{self.config.CONFIRMATION_TIMEFRAME}', f'RSI_SMA_{self.config.CONFIRMATION_TIMEFRAME}',
                     f'RSI_Diff_{self.config.CONFIRMATION_TIMEFRAME}', f'Avg_Diff_{self.config.CONFIRMATION_TIMEFRAME}',
                     'Signal_Price', 'Entry_Price', 'Quality', 'Confidence',
+
+                    # НОВІ колонки для скорингу
+                    'Total_Score', 'Base_Score', 'Technical_Score', 'Volume_Score',
+                    'Volatility_Score', 'Bonus_Score', 'Penalty_Score', 'Score_Percentage',
+
+                    # НОВІ колонки для об'єму
+                    'Volume_Quality', 'Volume_Ratio', 'Current_Volume', 'Avg_Volume',
+
+                    # НОВІ колонки для волатільності
+                    'Volatility_Quality', 'Volatility_Ratio', 'Current_ATR', 'Avg_ATR',
+
                     f'Primary_Passed_{self.config.PRIMARY_TIMEFRAME}',
                     f'Primary_Failed_{self.config.PRIMARY_TIMEFRAME}',
                     f'Confirmation_Passed_{self.config.CONFIRMATION_TIMEFRAME}',
@@ -1054,17 +1407,40 @@ class AdvancedSignalGenerator:
                         signal.status.value,
                         signal.signal_time.strftime('%Y-%m-%d %H:%M:%S'),
                         signal.entry_time.strftime('%Y-%m-%d %H:%M:%S'),
-                        f"{str(signal.rsi_1m).replace(".", ",")}",
-                        f"{str(signal.rsi_sma_1m).replace(".", ",")}",
-                        f"{str(signal.rsi_diff_1m).replace(".", ",")}",
-                        f"{str(signal.rsi_5m).replace(".", ",")}",
-                        f"{str(signal.rsi_sma_5m).replace(".", ",")}",
-                        f"{str(signal.rsi_diff_5m).replace(".", ",")}",
-                        f"{str(signal.avg_diff_5m).replace(".", ",")}",
-                        f"{str(signal.signal_price).replace(".", ",")}",
-                        f"{str(signal.entry_price).replace(".", ",")}",
+                        f"{str(signal.rsi_1m).replace('.', ',')}",
+                        f"{str(signal.rsi_sma_1m).replace('.', ',')}",
+                        f"{str(signal.rsi_diff_1m).replace('.', ',')}",
+                        f"{str(signal.rsi_5m).replace('.', ',')}",
+                        f"{str(signal.rsi_sma_5m).replace('.', ',')}",
+                        f"{str(signal.rsi_diff_5m).replace('.', ',')}",
+                        f"{str(signal.avg_diff_5m).replace('.', ',')}",
+                        f"{str(signal.signal_price).replace('.', ',')}",
+                        f"{str(signal.entry_price).replace('.', ',')}",
                         signal.quality.value,
                         f"{signal.confidence_score:.1f}%",
+
+                        # НОВІ дані скорингу
+                        f"{str(signal.signal_score.total_score).replace('.', ',')}",
+                        f"{str(signal.signal_score.base_score).replace('.', ',')}",
+                        f"{str(signal.signal_score.technical_score).replace('.', ',')}",
+                        f"{str(signal.signal_score.volume_score).replace('.', ',')}",
+                        f"{str(signal.signal_score.volatility_score).replace('.', ',')}",
+                        f"{str(signal.signal_score.bonus_score).replace('.', ',')}",
+                        f"{str(signal.signal_score.penalty_score).replace('.', ',')}",
+                        f"{str(signal.signal_score.score_percentage).replace('.', ',')}",
+
+                        # НОВІ дані об'єму
+                        signal.volume_analysis.volume_quality,
+                        f"{str(signal.volume_analysis.volume_ratio).replace('.', ',')}",
+                        f"{str(signal.volume_analysis.current_volume).replace('.', ',')}",
+                        f"{str(signal.volume_analysis.avg_volume).replace('.', ',')}",
+
+                        # НОВІ дані волатільності
+                        signal.volatility_analysis.volatility_quality,
+                        f"{str(signal.volatility_analysis.volatility_ratio).replace('.', ',')}",
+                        f"{str(signal.volatility_analysis.current_atr).replace('.', ',')}",
+                        f"{str(signal.volatility_analysis.avg_atr).replace('.', ',')}",
+
                         primary_passed_str,
                         primary_failed_str,
                         confirmation_passed_str,
@@ -1074,9 +1450,9 @@ class AdvancedSignalGenerator:
                     ]
                     writer.writerow(row)
 
-            print(f"📄 Детальні сигнали збережено у {filename}")
+            print(f"📄 Розширені сигнали збережено у {filename}")
 
-            # Статистика
+            # ОНОВЛЕНА статистика
             open_signals = [s for s in all_signals if s.status == SignalStatus.OPEN]
             skip_signals = [s for s in all_signals if s.status == SignalStatus.SKIP]
 
@@ -1090,25 +1466,37 @@ class AdvancedSignalGenerator:
                 short_signals = [s for s in open_signals if s.direction == 'Short']
                 print(f"   Long: {len(long_signals)}, Short: {len(short_signals)}")
 
+                avg_score = sum(s.signal_score.total_score for s in open_signals) / len(open_signals)
                 avg_confidence = sum(s.confidence_score for s in open_signals) / len(open_signals)
+                print(f"   Середній скор: {avg_score:.1f}")
                 print(f"   Середня впевненість: {avg_confidence:.1f}%")
+
+                # Розподіл по якості
+                quality_counts = {}
+                for signal in open_signals:
+                    quality = signal.quality.value
+                    quality_counts[quality] = quality_counts.get(quality, 0) + 1
+
+                print(f"   Розподіл по якості: {dict(quality_counts)}")
 
         except Exception as e:
             self.logger.error(f"Помилка збереження у CSV: {e}")
 
-    async def run_advanced_analysis(self, days_back: int = 7):
-        """Запуск поглибленого аналізу для всіх пар"""
-        print(
-            f"🚀 Запуск аналізу за покращеною стратегією ({self.config.PRIMARY_TIMEFRAME}/{self.config.CONFIRMATION_TIMEFRAME})")
-        print(f"📅 Період: {days_back} днів")
+    async def run_advanced_analysis(self):
+        """ОНОВЛЕНИЙ запуск аналізу з новими можливостями"""
+        print(f"🚀 Запуск покращеного аналізу v2.3")
+        print(f"📊 Таймфрейми: {self.config.PRIMARY_TIMEFRAME}/{self.config.CONFIRMATION_TIMEFRAME}")
+        print(f"⏰ Період сигналів: {self.config.SIGNAL_PERIOD_DAYS} днів {self.config.SIGNAL_PERIOD_HOURS} годин")
         print(f"💰 Пари: {len(self.config.PAIRS)}")
+        print(f"📈 Об'єм: {'Увімкнено' if self.config.USE_VOLUME_CHECKS else 'Вимкнено'}")
+        print(f"📊 Волатільність: {'Увімкнено' if self.config.USE_VOLATILITY_CHECKS else 'Вимкнено'}")
         print(f"🔧 Делей працює тільки для підтверджених сигналів!")
 
         all_signals = []
 
         for pair in self.config.PAIRS:
             try:
-                signals = await self.analyze_pair_advanced(pair, days_back)
+                signals = await self.analyze_pair_advanced(pair)
                 all_signals.extend(signals)
 
                 # Пауза між запитами
@@ -1123,29 +1511,59 @@ class AdvancedSignalGenerator:
             self.save_signals_to_csv(all_signals)
 
         print(f"\n✅ Аналіз завершено. Знайдено {len(all_signals)} сигналів")
-        print(f"📊 Підтверджених: {len([s for s in all_signals if s.status == SignalStatus.OPEN])}")
-        print(f"⏭️ Пропущених: {len([s for s in all_signals if s.status == SignalStatus.SKIP])}")
+
+        open_signals = [s for s in all_signals if s.status == SignalStatus.OPEN]
+        skip_signals = [s for s in all_signals if s.status == SignalStatus.SKIP]
+
+        print(f"📊 Підтверджених: {len(open_signals)}")
+        print(f"⏭️ Пропущених: {len(skip_signals)}")
+
+        if open_signals:
+            excellent_signals = [s for s in open_signals if s.quality == SignalQuality.EXCELLENT]
+            high_signals = [s for s in open_signals if s.quality == SignalQuality.HIGH]
+
+            print(f"🌟 Відмінних: {len(excellent_signals)}")
+            print(f"⭐ Високої якості: {len(high_signals)}")
+
+            avg_score = sum(s.signal_score.total_score for s in open_signals) / len(open_signals)
+            print(f"🎯 Середній скор: {avg_score:.1f}")
 
         return all_signals
 
 
 # Головна функція запуску
 async def main():
-    """Головна функція"""
-    # Створюємо конфігурацію
+    """ОНОВЛЕНА головна функція з новими налаштуваннями"""
+    # Створюємо конфігурацію з НОВИМИ параметрами
     config = AdvancedConfig(
         # Налаштування таймфреймів
-        PRIMARY_TIMEFRAME='1m',
-        CONFIRMATION_TIMEFRAME='5m',
+        PRIMARY_TIMEFRAME='5m',
+        CONFIRMATION_TIMEFRAME='15m',
+
+        # НОВИЙ: Гнучкий період для сигналів
+        SIGNAL_PERIOD_HOURS=0,  # Можна змінити на будь-який період!
+        SIGNAL_PERIOD_DAYS=7,  # Додатково дні (наприклад, 3 дні + 12 годин)
 
         # Налаштування параметрів стратегії
         MIN_DIFF=2.0,
         TREND_CANDLES=3,
-        DELAY_CANDLES=5,
+        DELAY_CANDLES=12,
         LONG_ENTRY_MAX_RSI=40.0,
         SHORT_ENTRY_MIN_RSI=60.0,
         PREOVERSOLD_LEVEL=33.0,
         PREBOUGHT_LEVEL=67.0,
+
+        # НОВІ: Параметри об'єму
+        USE_VOLUME_CHECKS=True,
+        VOLUME_SMA_PERIOD=20,
+        MIN_VOLUME_MULTIPLIER=1.15,
+        HIGH_VOLUME_MULTIPLIER=1.8,
+
+        # НОВІ: Параметри волатільності
+        USE_VOLATILITY_CHECKS=True,
+        ATR_PERIOD=14,
+        MIN_VOLATILITY_MULTIPLIER=0.7,
+        HIGH_VOLATILITY_MULTIPLIER=1.3,
 
         # Торгові пари
         PAIRS=[
@@ -1160,7 +1578,7 @@ async def main():
 
     # Запускаємо аналіз
     try:
-        signals = await generator.run_advanced_analysis(days_back=7)
+        signals = await generator.run_advanced_analysis()
 
         # Додатковий аналіз результатів
         if signals:
@@ -1171,13 +1589,14 @@ async def main():
 
             if open_signals:
                 print(f"🟢 Підтверджені позиції ({len(open_signals)}):")
-                for signal in open_signals[-5:]:  # Показуємо останні 5
-                    total_checks = len(signal.primary_checks_passed) + len(signal.confirmation_checks_passed)
+                # Сортуємо по скору та показуємо топ 5
+                sorted_signals = sorted(open_signals, key=lambda x: x.signal_score.total_score, reverse=True)
+                for signal in sorted_signals[:5]:
                     print(f"   {signal.pair} {signal.direction} {signal.signal_time.strftime('%m-%d %H:%M')} "
-                          f"Впевненість: {signal.confidence_score:.1f}% Перевірок пройдено: {total_checks}")
+                          f"Скор: {signal.signal_score.total_score:.1f} Якість: {signal.quality.value}")
 
             if skip_signals:
-                print(f"🟡 Пропущені сигнали ({len(skip_signals)}):")
+                print(f"🟡 Топ причини пропусків:")
                 skip_reasons = {}
                 for signal in skip_signals:
                     reason = signal.skip_reason
