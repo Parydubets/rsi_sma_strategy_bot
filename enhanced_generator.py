@@ -41,7 +41,7 @@ class AdvancedConfig:
 
     # НОВИЙ: Період для сигналів (можна вибирати)
     SIGNAL_PERIOD_HOURS: int = 24  # За скільки годин шукати сигнали (можна змінити на будь-який період)
-    SIGNAL_PERIOD_DAYS: int = 0  # Додатково дні (для більших періодів)
+    SIGNAL_PERIOD_DAYS: int = 30  # Додатково дні (для більших періодів)
 
     # ОНОВЛЕНІ ПАРАМЕТРИ СТРАТЕГІЇ
     RSI_PERIOD: int = 14
@@ -1314,7 +1314,7 @@ class AdvancedSignalGenerator:
             print(f"\n🔍 Аналізуємо {pair}...")
 
             # Розраховуємо необхідні дні для завантаження даних (більше ніж період сигналів для індикаторів)
-            days_back = max(self.get_signal_period_days(), 7)
+            days_back = max(self.get_signal_period_days(), 30)
 
             # Завантажуємо дані для двох таймфреймів
             df_primary, df_confirmation = await self.fetch_dual_timeframe_data(pair, days_back)
@@ -1542,7 +1542,7 @@ async def main():
 
         # НОВИЙ: Гнучкий період для сигналів
         SIGNAL_PERIOD_HOURS=0,  # Можна змінити на будь-який період!
-        SIGNAL_PERIOD_DAYS=7,  # Додатково дні (наприклад, 3 дні + 12 годин)
+        SIGNAL_PERIOD_DAYS=30,  # Додатково дні (наприклад, 3 дні + 12 годин)
 
         # Налаштування параметрів стратегії
         MIN_DIFF=2.0,

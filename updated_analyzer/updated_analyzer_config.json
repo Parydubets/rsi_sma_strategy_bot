@@ -1,0 +1,47 @@
+{
+  "trading_parameters": {
+    "stop_loss": 0.03,
+    "take_profit": 0.06,
+    "max_hold_hours": 8,
+    "use_trailing_stop": false,
+    "trailing_stop_activation": 0.0012,
+    "trailing_stop_distance": 0.006,
+    "max_volume_per_trade": 1000
+  },
+  "rsi_parameters": {
+    "rsi_period": 14,
+    "rsi_sma_period": 14,
+    "long_enter_zone": 30,
+    "short_enter_zone": 70,
+    "long_exit_zone": 55,
+    "short_exit_zone": 40,
+    "long_extreme_exit": 85,
+    "short_extreme_exit": 25
+  },
+  "timeframe_settings": {
+    "primary_timeframe": "5m",
+    "secondary_timeframes": [
+      "1h"
+    ]
+  },
+  "secondary_tf_filter": {
+    "short_enter_zone_mid_tf": 70,
+    "long_enter_zone_mid_tf": 43,
+    "sma_change_periods": 8,
+    "sma_change_threshold": 0.7,
+    "rsi_extreme_threshold": 18,
+    "cross_lookback_periods": 10
+  },
+  "data_management": {
+    "buffer_hours_before": 120,
+    "buffer_hours_after": 200,
+    "tf_multiplier": {
+      "5m": 1,
+      "15m": 4,
+      "30m": 8,
+      "1h": 12
+    }
+  },
+  "exchange": "bybit",
+  "banned_pairs": []
+}
