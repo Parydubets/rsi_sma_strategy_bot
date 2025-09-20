@@ -1,19 +1,23 @@
 {
   "trading_parameters": {
-    "stop_loss": 0.03,
-    "take_profit": 0.06,
-    "max_hold_hours": 8,
+    "stop_loss": 0.022,
+    "take_profit": 0.04,
+    "max_hold_hours": 24,
     "use_trailing_stop": false,
-    "trailing_stop_activation": 0.0012,
-    "trailing_stop_distance": 0.006,
+    "trailing_stop_activation": 0.01,
+    "trailing_stop_distance": 0.008,
+    "trailing_stop": {
+      "use_dynamic_trailing": true,
+      "atr_multiplier": 1.5
+    },
     "max_volume_per_trade": 1000
   },
   "rsi_parameters": {
     "rsi_period": 14,
     "rsi_sma_period": 14,
-    "long_enter_zone": 30,
-    "short_enter_zone": 70,
-    "long_exit_zone": 55,
+    "long_enter_zone": 40,
+    "short_enter_zone": 55,
+    "long_exit_zone": 70,
     "short_exit_zone": 40,
     "long_extreme_exit": 85,
     "short_extreme_exit": 25
@@ -21,19 +25,25 @@
   "timeframe_settings": {
     "primary_timeframe": "5m",
     "secondary_timeframes": [
-      "1h"
+      "30m"
     ]
   },
   "secondary_tf_filter": {
-    "short_enter_zone_mid_tf": 70,
-    "long_enter_zone_mid_tf": 43,
-    "sma_change_periods": 8,
-    "sma_change_threshold": 0.7,
-    "rsi_extreme_threshold": 18,
-    "cross_lookback_periods": 10
+    "short_enter_zone_mid_tf": 60,
+    "long_enter_zone_mid_tf": 45,
+    "sma_change_periods": 6,
+    "sma_change_threshold": 0.6,
+    "rsi_extreme_threshold": 15,
+    "cross_lookback_periods": 8
+  },
+  "volatility_filter": {
+    "enabled": true,
+    "min_atr_multiplier": 1.5,
+    "atr_period": 14,
+    "avg_atr_period": 50
   },
   "data_management": {
-    "buffer_hours_before": 120,
+    "buffer_hours_before": 100,
     "buffer_hours_after": 200,
     "tf_multiplier": {
       "5m": 1,

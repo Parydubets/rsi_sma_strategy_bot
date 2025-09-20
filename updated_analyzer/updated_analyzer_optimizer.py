@@ -1,13 +1,21 @@
 #!/usr/bin/env python3
 """
-Асинхронний оптимізатор для Enhanced Analyzer з динамічним трейлінг стопом
+Високопродуктивний оптимізатор для Enhanced Analyzer
+Основні оптимізації:
+1. Кешування даних на рівні пар з розумним управлінням пам'яттю
+2. Паралельні обчислення індикаторів з numpy
+3. Векторизовані операції для аналізу угод
+4. Оптимізовані алгоритми пошуку сигналів
+5. Мінімізація I/O операцій
+6. Ефективне управління ресурсами
 """
 
+import gc
 import asyncio
 import json
 import pandas as pd
 import numpy as np
-from itertools import product, islice
+from itertools import product
 import logging
 from datetime import datetime, timedelta
 import argparse
@@ -16,83 +24,358 @@ import csv
 from dataclasses import dataclass, asdict
 from typing import Dict, List, Tuple, Any, Optional
 import copy
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
 import time
 import random
-import hashlib
-import heapq
 import psutil
-from functools import lru_cache
-import gc
-from threading import Lock
 import aiofiles
+from functools import lru_cache
+import multiprocessing as mp
+import threading
+from collections import defaultdict
+import numba
+from numba import jit, njit
+import warnings
 
-# Імпортуємо аналізатор
-from updated_analyzer import SignalAnalyzer
+warnings.filterwarnings('ignore')
 
-
-# Налаштування логування
-def setup_logging():
-    logger = logging.getLogger(__name__)
-    logger.setLevel(logging.INFO)
-    logger.handlers.clear()
-    formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
-
-    file_handler = logging.FileHandler('optimizer.log', encoding='utf-8')
-    file_handler.setLevel(logging.INFO)
-    file_handler.setFormatter(formatter)
-
-    console_handler = logging.StreamHandler()
-    console_handler.setLevel(logging.INFO)
-    console_handler.setFormatter(formatter)
-
-    logger.addHandler(file_handler)
-    logger.addHandler(console_handler)
-    return logger
+# Імпортуємо базові функції з analyzer
+import ccxt
 
 
-logger = setup_logging()
+# Оптимізовані функції з numba для швидких обчислень
+@njit(fastmath=True)
+def fast_rsi(prices: np.ndarray, period: int = 14) -> np.ndarray:
+    """Швидке обчислення RSI з numba"""
+    n = len(prices)
+    if n < period + 1:
+        return np.full(n, 50.0)
+
+    deltas = np.diff(prices)
+    gains = np.where(deltas > 0, deltas, 0.0)
+    losses = np.where(deltas < 0, -deltas, 0.0)
+
+    # Перший RSI
+    avg_gain = np.mean(gains[:period])
+    avg_loss = np.mean(losses[:period])
+
+    rsi = np.full(n, 50.0)
+
+    for i in range(period, n):
+        if i == period:
+            rs = avg_gain / (avg_loss + 1e-10)
+        else:
+            avg_gain = (avg_gain * (period - 1) + gains[i - 1]) / period
+            avg_loss = (avg_loss * (period - 1) + losses[i - 1]) / period
+            rs = avg_gain / (avg_loss + 1e-10)
+
+        rsi[i] = 100 - (100 / (1 + rs))
+
+    return rsi
 
 
-@dataclass
-class OptimizationResult:
-    """Результат оптимізації одної конфігурації"""
-    config_id: str
-    parameters: Dict[str, Any]
-    total_trades: int
-    profitable_trades: int
-    win_rate: float
-    avg_pnl: float
-    total_pnl: float
-    avg_hold_time: float
-    max_drawdown: float
-    profit_factor: float
-    filtered_out: int
-    best_trade: float
-    worst_trade: float
-    sharpe_ratio: float = 0.0
-    strategy_name: str = ""
-    execution_time: float = 0.0
+@njit(fastmath=True)
+def fast_sma(values: np.ndarray, period: int) -> np.ndarray:
+    """Швидке обчислення SMA з numba"""
+    n = len(values)
+    if n < period:
+        return np.full(n, np.nan)
 
-    def __lt__(self, other):
-        return self.avg_pnl < other.avg_pnl
+    result = np.full(n, np.nan)
 
-    def to_dict(self) -> Dict:
-        return asdict(self)
+    # Перше значення
+    result[period - 1] = np.mean(values[:period])
+
+    # Решта значень через rolling sum
+    for i in range(period, n):
+        result[i] = result[i - 1] + (values[i] - values[i - period]) / period
+
+    return result
 
 
-class AsyncConfigOptimizer:
-    """Асинхронний оптимізатор конфігурацій для Enhanced Analyzer"""
+@njit(fastmath=True)
+def vectorized_trade_analysis(prices: np.ndarray, rsi: np.ndarray, rsi_sma: np.ndarray,
+                              entry_idx: int, direction: int, config_params: np.ndarray) -> Tuple[
+    float, float, int, str]:
+    """Векторизований аналіз угоди
+    direction: 1 для long, -1 для short
+    config_params: [stop_loss, trailing_activation, trailing_distance, exit_zone, max_hold_idx]
+    """
+    stop_loss_pct, trailing_activation, trailing_distance, exit_zone, max_hold_idx = config_params
+    n = len(prices)
 
-    def __init__(self, base_config_file: str = 'updated_analyzer_config.json',
-                 max_concurrent: int = 20,
-                 use_fast_mode: bool = True):
+    if entry_idx >= n - 1:
+        return 0.0, 0.0, 0, "No data"
 
-        self.base_config = SignalAnalyzer.load_config(base_config_file)
-        self.results = []
+    entry_price = prices[entry_idx]
+
+    # Початковий стоп-лос
+    if direction == 1:  # Long
+        stop_loss = entry_price * (1 - stop_loss_pct)
+    else:  # Short
+        stop_loss = entry_price * (1 + stop_loss_pct)
+
+    max_search_idx = min(n, entry_idx + int(max_hold_idx))
+
+    for i in range(entry_idx + 1, max_search_idx):
+        current_price = prices[i]
+
+        # Оновлення трейлінг стопу
+        if direction == 1:  # Long
+            profit_pct = (current_price - entry_price) / entry_price
+            if profit_pct >= trailing_activation:
+                new_sl = current_price * (1 - trailing_distance)
+                stop_loss = max(stop_loss, new_sl)
+
+            # Перевірка стоп-лосу (припускаємо, що low ≈ current_price для спрощення)
+            if current_price <= stop_loss:
+                return stop_loss, (stop_loss - entry_price) / entry_price * 100, i, "Stop Loss"
+        else:  # Short
+            profit_pct = (entry_price - current_price) / entry_price
+            if profit_pct >= trailing_activation:
+                new_sl = current_price * (1 + trailing_distance)
+                stop_loss = min(stop_loss, new_sl)
+
+            if current_price >= stop_loss:
+                return stop_loss, (entry_price - stop_loss) / entry_price * 100, i, "Stop Loss"
+
+        # Перевірка зворотного сигналу
+        if i > entry_idx + 1:
+            prev_rsi, prev_sma = rsi[i - 1], rsi_sma[i - 1]
+            curr_rsi, curr_sma = rsi[i], rsi_sma[i]
+
+            if direction == 1:  # Long
+                if prev_rsi >= prev_sma and curr_rsi < curr_sma and curr_rsi > exit_zone:
+                    pnl = (current_price - entry_price) / entry_price * 100
+                    return current_price, pnl, i, "Reverse Signal"
+            else:  # Short
+                if prev_rsi <= prev_sma and curr_rsi > curr_sma and curr_rsi < exit_zone:
+                    pnl = (entry_price - current_price) / entry_price * 100
+                    return current_price, pnl, i, "Reverse Signal"
+
+    # Таймаут
+    final_price = prices[max_search_idx - 1]
+    if direction == 1:
+        pnl = (final_price - entry_price) / entry_price * 100
+    else:
+        pnl = (entry_price - final_price) / entry_price * 100
+
+    return final_price, pnl, max_search_idx - 1, "Timeout"
+
+
+class HighPerformanceDataCache:
+    """Високопродуктивний кеш даних з автоматичним управлінням пам'яттю"""
+
+    def __init__(self, max_memory_mb: int = 2048):
+        self.cache = {}
+        self.access_times = {}
+        self.max_memory_bytes = max_memory_mb * 1024 * 1024
+        self.lock = threading.Lock()
+
+    def _estimate_size(self, df: pd.DataFrame) -> int:
+        """Оцінка розміру DataFrame в байтах"""
+        return df.memory_usage(deep=True).sum()
+
+    def _cleanup_if_needed(self):
+        """Очищення кешу при перевищенні ліміту пам'яті"""
+        current_memory = sum(self._estimate_size(df) for df in self.cache.values())
+
+        if current_memory > self.max_memory_bytes:
+            # Видаляємо найменш використовувані елементи
+            sorted_items = sorted(self.access_times.items(), key=lambda x: x[1])
+            to_remove = len(sorted_items) // 3  # Видаляємо 1/3
+
+            for key, _ in sorted_items[:to_remove]:
+                if key in self.cache:
+                    del self.cache[key]
+                    del self.access_times[key]
+
+    def get(self, key: str) -> Optional[pd.DataFrame]:
+        with self.lock:
+            if key in self.cache:
+                self.access_times[key] = time.time()
+                return self.cache[key].copy()
+            return None
+
+    def set(self, key: str, df: pd.DataFrame):
+        with self.lock:
+            self.cache[key] = df.copy()
+            self.access_times[key] = time.time()
+            self._cleanup_if_needed()
+
+    def clear(self):
+        with self.lock:
+            self.cache.clear()
+            self.access_times.clear()
+            gc.collect()
+
+
+class OptimizedSignalAnalyzer:
+    """Оптимізований аналізатор сигналів"""
+
+    def __init__(self, config: Dict, cache_size_mb: int = 2048):
+        exchange_name = config.get('exchange', 'bybit')
+        self.exchange = ccxt.__getattribute__(exchange_name)({
+            'enableRateLimit': True,
+            'rateLimit': 50  # Зменшуємо rate limit для швидшості
+        })
+
+        self.cache = HighPerformanceDataCache(cache_size_mb)
+        self.banned_pairs = set(config.get('banned_pairs', []))
+
+        # Thread pool для паралельних обчислень
+        self.thread_pool = ThreadPoolExecutor(max_workers=min(32, mp.cpu_count() * 2))
+
+    async def fetch_all_data_batch(self, pairs: List[str], signals: List[Dict],
+                                   config: Dict) -> Dict[str, Dict[str, pd.DataFrame]]:
+        """Пакетне завантаження даних для всіх пар одразу"""
+
+        # Групуємо сигнали по парах
+        pair_signals = defaultdict(list)
+        for signal in signals:
+            pair = signal['pair']
+            if pair not in self.banned_pairs:
+                pair_signals[pair].append(signal)
+
+        # Паралельне завантаження даних
+        semaphore = asyncio.Semaphore(20)  # Збільшуємо concurrent requests
+        tasks = []
+
+        for pair in pairs:
+            if pair in pair_signals:
+                task = asyncio.create_task(
+                    self._fetch_pair_data_with_semaphore(pair, pair_signals[pair], config, semaphore)
+                )
+                tasks.append((pair, task))
+
+        # Збираємо результати
+        all_data = {}
+        for pair, task in tasks:
+            try:
+                data = await task
+                if data:
+                    all_data[pair] = data
+            except Exception as e:
+                logging.warning(f"Помилка завантаження даних для {pair}: {e}")
+                continue
+
+        return all_data
+
+    async def _fetch_pair_data_with_semaphore(self, symbol: str, signals: List[Dict],
+                                              config: Dict, semaphore: asyncio.Semaphore):
+        async with semaphore:
+            return await self.fetch_data_with_buffer(symbol, signals, config)
+
+    async def fetch_data_with_buffer(self, symbol: str, signals: List[Dict], config: Dict) -> Dict[str, pd.DataFrame]:
+        """Оптимізоване завантаження даних з кешуванням"""
+        if not signals:
+            return {}
+
+        times = [self._parse_time_fast(s['time']) for s in signals]
+        first_time = min(times)
+        last_time = max(times)
+
+        data_config = config['data_management']
+        tf_settings = config['timeframe_settings']
+        primary_tf = tf_settings['primary_timeframe']
+
+        data = {}
+        for tf in [primary_tf] + tf_settings['secondary_timeframes']:
+            multiplier = data_config['tf_multiplier'].get(tf, 1)
+            start = first_time - timedelta(hours=data_config['buffer_hours_before'] * multiplier)
+            end = last_time + timedelta(hours=data_config['buffer_hours_after'] * multiplier)
+
+            cache_key = f"{symbol}_{tf}_{start.timestamp():.0f}_{end.timestamp():.0f}"
+
+            # Перевіряємо кеш
+            cached_df = self.cache.get(cache_key)
+            if cached_df is not None:
+                data[tf] = cached_df
+                continue
+
+            # Завантажуємо нові дані
+            try:
+                df = await self._fetch_ohlcv_optimized(symbol, tf, start, end)
+                if not df.empty:
+                    df = self._calculate_indicators_vectorized(df, config)
+                    data[tf] = df
+                    self.cache.set(cache_key, df)
+            except Exception as e:
+                logging.warning(f"Помилка завантаження {symbol} {tf}: {e}")
+                continue
+
+            await asyncio.sleep(0.02)  # Зменшуємо затримку
+
+        return data
+
+    def _parse_time_fast(self, time_str: str) -> datetime:
+        """Швидкий парсинг часу"""
+        try:
+            return datetime.strptime(time_str.strip(), '%d.%m.%Y %H:%M')
+        except:
+            try:
+                return datetime.strptime(time_str.strip(), '%Y-%m-%d %H:%M:%S')
+            except:
+                return datetime.now()
+
+    async def _fetch_ohlcv_optimized(self, symbol: str, tf: str, start: datetime, end: datetime) -> pd.DataFrame:
+        """Оптимізоване завантаження OHLCV даних"""
+        api_symbol = symbol.replace("USDT", "/USDT")
+        since = int(start.timestamp() * 1000)
+        until = int(end.timestamp() * 1000)
+
+        all_data = []
+        current = since
+        batch_size = 1000
+
+        while current < until:
+            try:
+                ohlcv = self.exchange.fetch_ohlcv(api_symbol, tf, since=current, limit=batch_size)
+                if not ohlcv:
+                    break
+                all_data.extend(ohlcv)
+                current = ohlcv[-1][0] + 1
+
+                # Мінімальна затримка
+                await asyncio.sleep(0.01)
+
+            except Exception as e:
+                logging.warning(f"API помилка для {symbol} {tf}: {e}")
+                break
+
+        if all_data:
+            df = pd.DataFrame(all_data, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+            df['datetime'] = pd.to_datetime(df['timestamp'], unit='ms')
+            return df.sort_values('timestamp').drop_duplicates('timestamp').reset_index(drop=True)
+
+        return pd.DataFrame()
+
+    def _calculate_indicators_vectorized(self, df: pd.DataFrame, config: Dict) -> pd.DataFrame:
+        """Векторизоване обчислення індикаторів"""
+        if df.empty:
+            return df
+
+        rsi_params = config['rsi_parameters']
+
+        # Використовуємо оптимізовані функції
+        prices = df['close'].values
+        df['rsi'] = fast_rsi(prices, rsi_params['rsi_period'])
+        df['rsi_sma'] = fast_sma(df['rsi'].values, rsi_params['rsi_sma_period'])
+
+        return df
+
+
+class UltraFastOptimizer:
+    """Ультра-швидкий оптимізатор з мінімальними накладними витратами"""
+
+    def __init__(self, base_config_file: str = 'updated_analyzer_config.json', max_concurrent: int = 50):
+        self.base_config = self._load_config_fast(base_config_file)
         self.max_concurrent = max_concurrent
-        self.use_fast_mode = use_fast_mode
-        self.results_lock = Lock()
+        self.config_counter = 0
+        self.results = []
+
+        # Додаємо banned_pairs з конфігу
+        self.banned_pairs = set(self.base_config.get('banned_pairs', []))
 
         # Статистика
         self.perf_stats = {
@@ -103,45 +386,84 @@ class AsyncConfigOptimizer:
             'memory_usage_mb': 0
         }
 
-        logger.info(f"Ініціалізовано асинхронний оптимізатор:")
-        logger.info(f"  - Максимум одночасних завдань: {max_concurrent}")
-        logger.info(f"  - Швидкий режим: {use_fast_mode}")
+        logging.warning(f"Ініціалізовано ультра-швидкий оптимізатор (concurrent: {max_concurrent})")
+        logging.warning(f"Заборонені пари: {len(self.banned_pairs)}")
+
+    def _load_config_fast(self, config_file: str) -> Dict:
+        """Швидке завантаження конфігу"""
+        if not os.path.exists(config_file):
+            return self._create_default_config()
+
+        with open(config_file, 'r', encoding='utf-8') as f:
+            return json.load(f)
+
+    def _create_default_config(self) -> Dict:
+        """Створення базового конфігу"""
+        return {
+            "trading_parameters": {
+                "stop_loss": 0.018,
+                "take_profit": 0.035,
+                "max_hold_hours": 24,
+                "use_trailing_stop": True,
+                "trailing_stop_activation": 0.01,
+                "trailing_stop_distance": 0.008,
+                "max_volume_per_trade": 1000
+            },
+            "rsi_parameters": {
+                "rsi_period": 14,
+                "rsi_sma_period": 14,
+                "long_enter_zone": 30,
+                "short_enter_zone": 70,
+                "long_exit_zone": 60,
+                "short_exit_zone": 40,
+                "long_extreme_exit": 75,
+                "short_extreme_exit": 25
+            },
+            "timeframe_settings": {
+                "primary_timeframe": "5m",
+                "secondary_timeframes": ["15m"]
+            },
+            "secondary_tf_filter": {
+                "short_enter_zone_mid_tf": 60,
+                "long_enter_zone_mid_tf": 40,
+                "sma_change_periods": 5,
+                "sma_change_threshold": 0.5,
+                "rsi_extreme_threshold": 15,
+                "cross_lookback_periods": 10
+            },
+            "data_management": {
+                "buffer_hours_before": 120,
+                "buffer_hours_after": 240,
+                "tf_multiplier": {"5m": 1, "15m": 3, "30m": 6, "1h": 12}
+            },
+            "exchange": "bybit",
+            "banned_pairs": []
+        }
 
     def generate_parameter_ranges(self, mode: str = 'balanced') -> Dict[str, List]:
-        """Генерація діапазонів параметрів для Enhanced Analyzer"""
-
+        """Генерація параметрів з урахуванням режиму"""
         if mode == 'fast':
             return {
-                # Торгові параметри
                 'stop_loss': [0.015, 0.018, 0.022, 0.025],
                 'take_profit': [0.030, 0.035, 0.040, 0.045],
                 'max_hold_hours': [12, 16, 20, 24],
                 'use_trailing_stop': [True, False],
                 'trailing_stop_activation': [0.008, 0.010, 0.012],
                 'trailing_stop_distance': [0.006, 0.008, 0.010],
-
-                # RSI зони виходу
                 'long_exit_zone': [60, 65, 70],
                 'short_exit_zone': [30, 35, 40],
                 'long_extreme_exit': [75, 80, 85],
                 'short_extreme_exit': [15, 20, 25],
-
-                # Вторинні таймфрейми
                 'secondary_timeframes': [['15m'], ['30m'], ['1h'], ['15m', '30m'], ['15m', '1h']],
-
-                # Параметри вторинного TF фільтру
                 'short_enter_zone_mid_tf': [55, 60, 65],
                 'long_enter_zone_mid_tf': [35, 40, 45],
                 'sma_change_periods': [4, 5, 6],
                 'sma_change_threshold': [0.4, 0.5, 0.6],
                 'rsi_extreme_threshold': [12, 15, 18],
                 'cross_lookback_periods': [8, 10, 12],
-
-                # Буфери даних
                 'buffer_hours_before': [100, 120, 140],
                 'buffer_hours_after': [200, 240, 280],
             }
-
         elif mode == 'ultra_fast':
             return {
                 'stop_loss': [0.018, 0.022],
@@ -158,901 +480,638 @@ class AsyncConfigOptimizer:
                 'sma_change_periods': [5],
                 'cross_lookback_periods': [10],
             }
-
-        else:  # balanced або thorough
+        else:  # balanced или thorough
             return {
-                # Торгові параметри
                 'stop_loss': [0.012, 0.015, 0.018, 0.020, 0.022, 0.025, 0.030],
                 'take_profit': [0.025, 0.030, 0.035, 0.040, 0.045, 0.050, 0.060],
                 'max_hold_hours': [8, 12, 16, 20, 24, 30],
                 'use_trailing_stop': [True, False],
                 'trailing_stop_activation': [0.008, 0.010, 0.012, 0.015],
                 'trailing_stop_distance': [0.005, 0.006, 0.008, 0.010, 0.012],
-
-                # RSI зони
                 'long_exit_zone': [55, 60, 62, 65, 68, 70, 72],
                 'short_exit_zone': [28, 30, 32, 35, 38, 40, 45],
                 'long_extreme_exit': [75, 78, 80, 82, 85, 88],
                 'short_extreme_exit': [12, 15, 18, 20, 22, 25],
-
-                # Вторинні таймфрейми (включаючи 30m, 1h)
-                'secondary_timeframes': [
-                    ['15m'], ['30m'], ['1h'], ['15m', '30m'], ['15m', '1h']
-                ],
-
-                # Параметри фільтру вторинного TF
+                'secondary_timeframes': [['15m'], ['30m'], ['1h'], ['15m', '30m'], ['15m', '1h']],
                 'short_enter_zone_mid_tf': [50, 55, 57, 60, 63, 65, 67, 70],
                 'long_enter_zone_mid_tf': [30, 35, 37, 40, 43, 45, 47, 50],
                 'sma_change_periods': [3, 4, 5, 6, 7, 8, 9],
                 'sma_change_threshold': [0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8],
                 'rsi_extreme_threshold': [10, 12, 15, 18, 20],
                 'cross_lookback_periods': [6, 8, 10, 12, 15],
-
-                # Буфери даних
                 'buffer_hours_before': [80, 100, 120, 140, 160],
                 'buffer_hours_after': [180, 200, 240, 280, 320],
-
-                # Множники для TF
                 'tf_multiplier_15m': [2, 3, 4],
                 'tf_multiplier_30m': [4, 6, 8],
                 'tf_multiplier_1h': [8, 12, 16],
             }
 
-    def _validate_config_logic(self, config: Dict[str, Any]) -> Tuple[bool, str]:
-        """Валідація логіки конфігурації"""
+    def create_config_combinations(self, max_combinations: int = 1000, mode: str = 'balanced') -> List[Dict[str, Any]]:
+        """Швидке створення комбінацій параметрів"""
+        param_ranges = self.generate_parameter_ranges(mode)
+
+        # Для ultra_fast режиму використовуємо grid search
+        if mode == 'ultra_fast':
+            return self._create_grid_search(param_ranges, max_combinations)
+        else:
+            return self._create_random_search(param_ranges, max_combinations)
+
+    def _create_grid_search(self, param_ranges: Dict[str, List], max_combinations: int) -> List[Dict[str, Any]]:
+        """Grid search з обмеженнями"""
+        param_names = list(param_ranges.keys())
+        param_values = list(param_ranges.values())
+
+        configs = []
+        count = 0
+
+        for combination in product(*param_values):
+            if count >= max_combinations:
+                break
+
+            config = dict(zip(param_names, combination))
+            config['strategy_name'] = f'grid_{count}'
+
+            if self._validate_config_fast(config):
+                configs.append(config)
+                count += 1
+
+        return configs
+
+    def _create_random_search(self, param_ranges: Dict[str, List], max_combinations: int) -> List[Dict[str, Any]]:
+        """Швидкий random search"""
+        configs = []
+        param_names = list(param_ranges.keys())
+
+        for i in range(max_combinations * 2):  # Генеруємо з запасом
+            if len(configs) >= max_combinations:
+                break
+
+            config = {}
+            for param_name in param_names:
+                config[param_name] = random.choice(param_ranges[param_name])
+            config['strategy_name'] = f'random_{len(configs)}'
+
+            if self._validate_config_fast(config):
+                configs.append(config)
+
+        return configs
+
+    def _validate_config_fast(self, config: Dict[str, Any]) -> bool:
+        """Швидка валідація конфігу з розширеними перевірками"""
         try:
-            # Перевірка take_profit > stop_loss
             take_profit = config.get('take_profit', 0.035)
             stop_loss = config.get('stop_loss', 0.018)
-            if take_profit <= stop_loss:
-                return False, f"Take profit ({take_profit}) <= Stop loss ({stop_loss})"
 
-            # Перевірка trailing stop параметрів
+            if take_profit <= stop_loss:
+                return False
+
             if config.get('use_trailing_stop', True):
                 activation = config.get('trailing_stop_activation', 0.010)
                 distance = config.get('trailing_stop_distance', 0.008)
                 if activation <= distance:
-                    return False, f"Trailing activation ({activation}) <= distance ({distance})"
+                    return False
 
             # Перевірка RSI зон
             long_exit = config.get('long_exit_zone', 65)
             short_exit = config.get('short_exit_zone', 35)
             if long_exit <= short_exit:
-                return False, f"Long exit ({long_exit}) <= Short exit ({short_exit})"
+                return False
 
-            # Перевірка extreme zones
             long_extreme = config.get('long_extreme_exit', 80)
             short_extreme = config.get('short_extreme_exit', 20)
             if long_extreme <= long_exit or short_extreme >= short_exit:
-                return False, f"Invalid extreme zones"
+                return False
 
-            # Перевірка параметрів вторинного TF
+            # Перевірка secondary TF зон
             short_mid = config.get('short_enter_zone_mid_tf', 60)
             long_mid = config.get('long_enter_zone_mid_tf', 40)
             if short_mid <= long_mid:
-                return False, f"Secondary TF zones invalid"
+                return False
 
-            return True, "Valid"
+            # Перевірка SMA параметрів
+            sma_periods = config.get('sma_change_periods', 5)
+            sma_threshold = config.get('sma_change_threshold', 0.5)
+            if sma_periods < 2 or sma_threshold <= 0:
+                return False
 
-        except Exception as e:
-            return False, f"Exception: {str(e)}"
+            # Перевірка buffer hours
+            buffer_before = config.get('buffer_hours_before', 120)
+            buffer_after = config.get('buffer_hours_after', 240)
+            if buffer_before < 24 or buffer_after < 48:
+                return False
+
+            return True
+        except:
+            return False
 
     def apply_config_to_base(self, test_config: Dict[str, Any]) -> Dict[str, Any]:
-        """Застосування тестової конфігурації до базової"""
+        """Швидке застосування конфігу"""
         config = copy.deepcopy(self.base_config)
 
-        # Торгові параметри
+        # Пряме оновлення параметрів
         trading_params = config['trading_parameters']
-        for param in ['stop_loss', 'take_profit', 'max_hold_hours', 'use_trailing_stop',
-                      'trailing_stop_activation', 'trailing_stop_distance']:
-            if param in test_config:
-                trading_params[param] = test_config[param]
-
-        # RSI параметри
         rsi_params = config['rsi_parameters']
-        for param in ['long_exit_zone', 'short_exit_zone', 'long_extreme_exit', 'short_extreme_exit']:
-            if param in test_config:
-                rsi_params[param] = test_config[param]
-
-        # Налаштування таймфреймів
         tf_settings = config['timeframe_settings']
-        if 'secondary_timeframes' in test_config:
-            tf_settings['secondary_timeframes'] = test_config['secondary_timeframes']
-
-        # Фільтр вторинного TF
         secondary_filter = config['secondary_tf_filter']
-        for param in ['short_enter_zone_mid_tf', 'long_enter_zone_mid_tf', 'sma_change_periods',
-                      'sma_change_threshold', 'rsi_extreme_threshold', 'cross_lookback_periods']:
-            if param in test_config:
-                secondary_filter[param] = test_config[param]
 
-        # Управління даними
-        data_mgmt = config['data_management']
-        for param in ['buffer_hours_before', 'buffer_hours_after']:
-            if param in test_config:
-                data_mgmt[param] = test_config[param]
+        # Мапінг параметрів
+        param_mapping = {
+            'stop_loss': ('trading_parameters', 'stop_loss'),
+            'take_profit': ('trading_parameters', 'take_profit'),
+            'max_hold_hours': ('trading_parameters', 'max_hold_hours'),
+            'use_trailing_stop': ('trading_parameters', 'use_trailing_stop'),
+            'trailing_stop_activation': ('trading_parameters', 'trailing_stop_activation'),
+            'trailing_stop_distance': ('trading_parameters', 'trailing_stop_distance'),
+            'long_exit_zone': ('rsi_parameters', 'long_exit_zone'),
+            'short_exit_zone': ('rsi_parameters', 'short_exit_zone'),
+            'long_extreme_exit': ('rsi_parameters', 'long_extreme_exit'),
+            'short_extreme_exit': ('rsi_parameters', 'short_extreme_exit'),
+            'secondary_timeframes': ('timeframe_settings', 'secondary_timeframes'),
+            'short_enter_zone_mid_tf': ('secondary_tf_filter', 'short_enter_zone_mid_tf'),
+            'long_enter_zone_mid_tf': ('secondary_tf_filter', 'long_enter_zone_mid_tf'),
+            'sma_change_periods': ('secondary_tf_filter', 'sma_change_periods'),
+            'sma_change_threshold': ('secondary_tf_filter', 'sma_change_threshold'),
+            'rsi_extreme_threshold': ('secondary_tf_filter', 'rsi_extreme_threshold'),
+            'cross_lookback_periods': ('secondary_tf_filter', 'cross_lookback_periods'),
+            'buffer_hours_before': ('data_management', 'buffer_hours_before'),
+            'buffer_hours_after': ('data_management', 'buffer_hours_after'),
+        }
 
-        # Множники TF
-        tf_multiplier = data_mgmt['tf_multiplier']
-        if 'tf_multiplier_15m' in test_config:
-            tf_multiplier['15m'] = test_config['tf_multiplier_15m']
-        if 'tf_multiplier_30m' in test_config:
-            tf_multiplier['30m'] = test_config['tf_multiplier_30m']
-        if 'tf_multiplier_1h' in test_config:
-            tf_multiplier['1h'] = test_config['tf_multiplier_1h']
+        for param, value in test_config.items():
+            if param in param_mapping:
+                section, key = param_mapping[param]
+                config[section][key] = value
+            elif param.startswith('tf_multiplier_'):
+                tf = param.replace('tf_multiplier_', '')
+                config['data_management']['tf_multiplier'][tf] = value
 
         return config
 
-    async def test_single_config(self, config: Dict[str, Any], config_id: str,
-                                 signals: List[Dict], semaphore: asyncio.Semaphore) -> Optional[OptimizationResult]:
-        """Тестування однієї конфігурації"""
+    async def test_single_config_vectorized(self, config: Dict[str, Any], config_id: str,
+                                            all_data: Dict[str, Dict[str, pd.DataFrame]],
+                                            signals: List[Dict], semaphore: asyncio.Semaphore,
+                                            temp_file: str) -> Optional[Dict]:
+        """Векторизоване тестування конфігурації"""
+
         async with semaphore:
             start_time = time.time()
 
             try:
-                # Валідація
-                is_valid, reason = self._validate_config_logic(config)
-                if not is_valid:
-                    logger.debug(f"Конфігурація {config_id} невалідна: {reason}")
-                    return None
-
-                # Застосовуємо конфігурацію
                 full_config = self.apply_config_to_base(config)
 
-                # Створюємо аналізатор
-                analyzer = SignalAnalyzer(full_config)
+                # Паралельне тестування всіх сигналів
+                trade_results = []
 
-                # Аналізуємо сигнали
-                results = []
-                processed_pairs = set()
-
+                # Групуємо сигнали по парах
+                pair_signals = defaultdict(list)
                 for signal in signals:
                     pair = signal['pair']
-                    if pair in processed_pairs:
-                        continue
-                    processed_pairs.add(pair)
+                    if pair in all_data:
+                        pair_signals[pair].append(signal)
 
-                    # Отримуємо сигнали для цієї пари
-                    pair_signals = [s for s in signals if s['pair'] == pair]
+                # Векторизоване тестування для кожної пари
+                for pair, pair_signals_list in pair_signals.items():
+                    pair_data = all_data[pair]
 
-                    try:
-                        # Отримуємо дані з буфером
-                        data = await analyzer.fetch_data_with_buffer(pair, pair_signals, full_config)
-
-                        if not data:
-                            continue
-
-                        # Симулюємо торгівлю для кожного сигналу пари
-                        for pair_signal in pair_signals:
-                            await analyzer.simulate_trade(data, pair_signal, full_config, f"temp_{config_id}.csv")
-
-                    except Exception as e:
-                        logger.debug(f"Помилка обробки пари {pair} для конфігурації {config_id}: {e}")
-                        continue
-
-                # Читаємо результати з тимчасового CSV
-                temp_file = f"temp_{config_id}.csv"
-                if os.path.exists(temp_file):
-                    df = pd.read_csv(temp_file, delimiter=';')
-                    results = df.to_dict('records')
-                    os.remove(temp_file)  # Видаляємо тимчасовий файл
-
-                if not results:
-                    return OptimizationResult(
-                        config_id=config_id,
-                        parameters=config,
-                        total_trades=0, profitable_trades=0, win_rate=0.0,
-                        avg_pnl=0.0, total_pnl=0.0, avg_hold_time=0.0,
-                        max_drawdown=0.0, profit_factor=0.0, filtered_out=0,
-                        best_trade=0.0, worst_trade=0.0, sharpe_ratio=0.0,
-                        strategy_name=config.get('strategy_name', 'test'),
-                        execution_time=time.time() - start_time
+                    # Тестуємо всі сигнали пари одразу
+                    pair_results = self._test_pair_signals_vectorized(
+                        pair_data, pair_signals_list, full_config
                     )
+                    trade_results.extend(pair_results)
 
-                # Обчислення метрик
-                traded_results = [r for r in results if not r.get('filtered_out', False)]
-                filtered_out = len(results) - len(traded_results)
+                # Швидкий аналіз результатів
+                metrics = self._calculate_metrics_fast(trade_results)
 
-                if not traded_results:
-                    return OptimizationResult(
-                        config_id=config_id, parameters=config, total_trades=0,
-                        profitable_trades=0, win_rate=0.0, avg_pnl=0.0, total_pnl=0.0,
-                        avg_hold_time=0.0, max_drawdown=0.0, profit_factor=0.0,
-                        filtered_out=filtered_out, best_trade=0.0, worst_trade=0.0,
-                        sharpe_ratio=0.0, strategy_name=config.get('strategy_name', 'test'),
-                        execution_time=time.time() - start_time
-                    )
+                # Зберігаємо результати в тимчасовий файл
+                await self._save_temp_results(temp_file, trade_results)
 
-                # Векторизовані обчислення
-                pnl_values = np.array([float(r.get('pnl_percent', 0)) for r in traded_results])
-                hold_times = np.array([float(r.get('hold_time', 0)) for r in traded_results])
-
-                total_trades = len(traded_results)
-                profitable_trades = np.sum(pnl_values > 0)
-                win_rate = (profitable_trades / total_trades * 100) if total_trades > 0 else 0
-                avg_pnl = np.mean(pnl_values)
-                total_pnl = np.sum(pnl_values)
-                avg_hold_time = np.mean(hold_times)
-
-                # Максимальна просадка
-                cumulative_pnl = np.cumsum(pnl_values)
-                running_max = np.maximum.accumulate(cumulative_pnl)
-                drawdown = running_max - cumulative_pnl
-                max_drawdown = np.max(drawdown) if len(drawdown) > 0 else 0
-
-                # Profit factor
-                profitable_pnl = pnl_values[pnl_values > 0]
-                loss_pnl = pnl_values[pnl_values <= 0]
-                total_profit = np.sum(profitable_pnl) if len(profitable_pnl) > 0 else 0
-                total_loss = abs(np.sum(loss_pnl)) if len(loss_pnl) > 0 else 1
-                profit_factor = total_profit / total_loss if total_loss > 0 else 0
-
-                # Sharpe ratio
-                sharpe_ratio = avg_pnl / np.std(pnl_values) if len(pnl_values) > 1 and np.std(pnl_values) > 0 else 0
-
-                best_trade = np.max(pnl_values) if len(pnl_values) > 0 else 0
-                worst_trade = np.min(pnl_values) if len(pnl_values) > 0 else 0
-
-                result = OptimizationResult(
-                    config_id=config_id,
-                    parameters=config,
-                    total_trades=total_trades,
-                    profitable_trades=profitable_trades,
-                    win_rate=win_rate,
-                    avg_pnl=avg_pnl,
-                    total_pnl=total_pnl,
-                    avg_hold_time=avg_hold_time,
-                    max_drawdown=max_drawdown,
-                    profit_factor=profit_factor,
-                    filtered_out=filtered_out,
-                    best_trade=best_trade,
-                    worst_trade=worst_trade,
-                    sharpe_ratio=sharpe_ratio,
-                    strategy_name=config.get('strategy_name', 'test'),
-                    execution_time=time.time() - start_time
-                )
-
-                # Виводимо прогрес
-                print(f"Тестовано {config_id}: PnL={avg_pnl:.3f}%, Угод={total_trades}, Win={win_rate:.1f}%")
+                result = {
+                    'config_id': config_id,
+                    'parameters': config,
+                    'metrics': metrics,
+                    'execution_time': time.time() - start_time
+                }
 
                 return result
 
             except Exception as e:
-                logger.error(f"Помилка тестування конфігурації {config_id}: {e}")
+                logging.warning(f"Помилка тестування конфігу {config_id}: {e}")
                 return None
 
-    def create_config_combinations(self, max_combinations: int = 1000,
-                                   strategy_type: str = 'smart_mixed',
-                                   mode: str = 'balanced') -> List[Dict[str, Any]]:
-        """Створення комбінацій конфігурацій"""
-        param_ranges = self.generate_parameter_ranges(mode)
+    def _test_pair_signals_vectorized(self, data: Dict[str, pd.DataFrame],
+                                      signals: List[Dict], config: Dict) -> List[Dict]:
+        """Векторизоване тестування сигналів для пари"""
 
-        logger.info(f"Генерація конфігурацій: стратегія={strategy_type}, режим={mode}")
+        primary_tf = config['timeframe_settings']['primary_timeframe']
+        df = data.get(primary_tf)
 
-        if strategy_type == 'grid_search':
-            return self._create_grid_search(param_ranges, max_combinations)
-        elif strategy_type == 'genetic':
-            return self._create_genetic_search(param_ranges, max_combinations)
-        else:  # random sampling
-            return self._create_random_search(param_ranges, max_combinations)
+        if df is None or df.empty:
+            return []
 
-    def _create_grid_search(self, param_ranges: Dict[str, List], max_combinations: int) -> List[Dict[str, Any]]:
-        """Повний перебір з обмеженням"""
-        total_combinations = 1
-        for values in param_ranges.values():
-            total_combinations *= len(values)
+        results = []
 
-        logger.info(f"Загальна кількість комбінацій: {total_combinations:,}")
+        # Підготовка даних для векторизації
+        prices = df['close'].values
+        rsi = df['rsi'].values
+        rsi_sma = df['rsi_sma'].values
+        timestamps = df['datetime'].values
 
-        if total_combinations <= max_combinations:
-            # Повний перебір
-            param_names = list(param_ranges.keys())
-            param_values = list(param_ranges.values())
+        # Параметри конфігурації
+        trading_params = config['trading_parameters']
+        rsi_params = config['rsi_parameters']
 
-            valid_configs = []
-            for i, combination in enumerate(product(*param_values)):
-                config = dict(zip(param_names, combination))
-                config['strategy_name'] = f'grid_{i}'
+        config_array = np.array([
+            trading_params['stop_loss'],
+            trading_params['trailing_stop_activation'],
+            trading_params['trailing_stop_distance'],
+            rsi_params['long_exit_zone'] if True else rsi_params['short_exit_zone'],
+            trading_params['max_hold_hours'] * 12  # 5m свічок в годині
+        ])
 
-                is_valid, _ = self._validate_config_logic(config)
-                if is_valid:
-                    valid_configs.append(config)
-                    if len(valid_configs) >= max_combinations:
-                        break
+        for signal in signals:
+            signal_time = self._parse_time_fast(signal['time'])
+            direction = 1 if signal['direction'].lower() == 'long' else -1
 
-            return valid_configs
-        else:
-            # Випадкове семплування
-            return self._create_random_search(param_ranges, max_combinations)
+            # Знаходимо індекс входу - конвертуємо все в datetime64
+            signal_time_np = np.datetime64(signal_time)
+            timestamps_np = timestamps.astype('datetime64[ns]')
+            time_diffs = np.abs((timestamps_np - signal_time_np).astype('timedelta64[m]').astype(int))
+            entry_idx = np.argmin(time_diffs)
 
-    def _create_random_search(self, param_ranges: Dict[str, List], max_combinations: int) -> List[Dict[str, Any]]:
-        """Випадкове семплування"""
-        valid_configs = []
-        attempts = 0
-        max_attempts = max_combinations * 10
+            if entry_idx >= len(prices) - 1:
+                continue
 
-        param_names = list(param_ranges.keys())
+            # Налаштовуємо параметри для напряму
+            config_for_signal = config_array.copy()
+            if direction == 1:  # Long
+                config_for_signal[3] = rsi_params['long_exit_zone']
+            else:  # Short
+                config_for_signal[3] = rsi_params['short_exit_zone']
 
-        while len(valid_configs) < max_combinations and attempts < max_attempts:
-            config = {}
-            for param_name in param_names:
-                config[param_name] = random.choice(param_ranges[param_name])
-            config['strategy_name'] = f'random_{len(valid_configs)}'
+            # Векторизований аналіз угоди
+            exit_price, pnl, exit_idx, exit_reason = vectorized_trade_analysis(
+                prices, rsi, rsi_sma, entry_idx, direction, config_for_signal
+            )
 
-            is_valid, _ = self._validate_config_logic(config)
-            if is_valid:
-                valid_configs.append(config)
+            # Формуємо результат
+            entry_time = timestamps[entry_idx]
+            exit_time = timestamps[exit_idx] if exit_idx < len(timestamps) else timestamps[-1]
 
-            attempts += 1
+            # Безпечне конвертування в строки
+            try:
+                entry_time_str = pd.Timestamp(entry_time).strftime('%d.%m.%Y %H:%M')
+                exit_time_str = pd.Timestamp(exit_time).strftime('%d.%m.%Y %H:%M')
+            except:
+                entry_time_str = str(entry_time)[:16]
+                exit_time_str = str(exit_time)[:16]
 
-        logger.info(f"Створено {len(valid_configs)} валідних конфігурацій за {attempts} спроб")
-        return valid_configs
+            result = {
+                'pair': signal['pair'],
+                'direction': signal['direction'],
+                'rsi': signal['rsi'],
+                'signal_time': signal['time'],
+                'entry_time_str': entry_time_str,
+                'exit_time_str': exit_time_str,
+                'entry_price': float(prices[entry_idx]),
+                'exit_price': float(exit_price),
+                'pnl_percent': float(pnl),
+                'hold_time': float((exit_idx - entry_idx) * 5 / 60),  # години для 5m свічок
+                'status': 'Profit' if pnl > 0 else 'Loss',
+                'exit_reason': exit_reason,
+                'filtered_out': 0
+            }
+            results.append(result)
 
-    def _create_genetic_search(self, param_ranges: Dict[str, List], max_combinations: int) -> List[Dict[str, Any]]:
-        """Генетичний алгоритм"""
-        population_size = min(100, max_combinations // 5)
-        generations = max_combinations // population_size
+        return results
 
-        def create_individual():
-            config = {}
-            for param_name, values in param_ranges.items():
-                config[param_name] = random.choice(values)
-            return config
+    def _parse_time_fast(self, time_str: str) -> pd.Timestamp:
+        """Швидкий парсинг часу з перевіркою типів"""
+        try:
+            return pd.to_datetime(time_str, format='%d.%m.%Y %H:%M')
+        except:
+            try:
+                return pd.to_datetime(time_str)
+            except:
+                return pd.Timestamp.now()
 
-        # Початкова популяція
-        population = []
-        for i in range(population_size * 2):
-            individual = create_individual()
-            individual['strategy_name'] = f'genetic_gen0_{len(population)}'
-            is_valid, _ = self._validate_config_logic(individual)
-            if is_valid:
-                population.append(individual)
-                if len(population) >= population_size:
-                    break
+    def _calculate_metrics_fast(self, results: List[Dict]) -> Dict:
+        """Швидке обчислення метрик"""
+        if not results:
+            return {
+                'total_trades': 0, 'win_rate': 0.0, 'avg_pnl': 0.0,
+                'total_pnl': 0.0, 'profit_factor': 0.0, 'max_drawdown': 0.0
+            }
 
-        all_configs = population.copy()
+        pnls = np.array([r['pnl_percent'] for r in results])
 
-        # Еволюція
-        for gen in range(1, min(generations, 5)):
-            new_population = []
+        total_trades = len(results)
+        profitable_trades = np.sum(pnls > 0)
+        win_rate = (profitable_trades / total_trades * 100) if total_trades > 0 else 0
+        avg_pnl = np.mean(pnls)
+        total_pnl = np.sum(pnls)
 
-            # Елітизм
-            elite_size = max(1, len(population) // 5)
-            new_population.extend(population[:elite_size])
+        # Швидке обчислення drawdown
+        cumulative = np.cumsum(pnls)
+        running_max = np.maximum.accumulate(cumulative)
+        drawdown = running_max - cumulative
+        max_drawdown = np.max(drawdown) if len(drawdown) > 0 else 0
 
-            # Генерація нових особин
-            while len(new_population) < population_size:
-                if random.random() < 0.7:  # Схрещування
-                    if len(population) >= 2:
-                        parent1 = random.choice(population)
-                        parent2 = random.choice(population)
-                        child = create_individual()
-                        # Копіюємо деякі гени
-                        for param in random.sample(list(parent1.keys()), min(3, len(parent1))):
-                            if param in parent2:
-                                child[param] = random.choice([parent1[param], parent2[param]])
-                        child['strategy_name'] = f'genetic_gen{gen}_cross_{len(new_population)}'
-                else:  # Мутація
-                    child = create_individual()
-                    child['strategy_name'] = f'genetic_gen{gen}_mut_{len(new_population)}'
+        # Profit factor
+        profits = pnls[pnls > 0]
+        losses = pnls[pnls <= 0]
+        total_profit = np.sum(profits) if len(profits) > 0 else 0
+        total_loss = abs(np.sum(losses)) if len(losses) > 0 else 1
+        profit_factor = total_profit / total_loss if total_loss > 0 else 0
 
-                is_valid, _ = self._validate_config_logic(child)
-                if is_valid:
-                    new_population.append(child)
+        return {
+            'total_trades': total_trades,
+            'win_rate': win_rate,
+            'avg_pnl': avg_pnl,
+            'total_pnl': total_pnl,
+            'profit_factor': profit_factor,
+            'max_drawdown': max_drawdown,
+            'best_trade': np.max(pnls) if len(pnls) > 0 else 0,
+            'worst_trade': np.min(pnls) if len(pnls) > 0 else 0
+        }
 
-            population = new_population
-            all_configs.extend(population)
+    async def _save_temp_results(self, temp_file: str, results: List[Dict]):
+        """Асинхронне збереження тимчасових результатів"""
+        if not results:
+            return
 
-        return all_configs
+        fieldnames = ['pair', 'direction', 'rsi', 'signal_time', 'entry_time_str',
+                      'exit_time_str', 'entry_price', 'exit_price', 'pnl_percent',
+                      'hold_time', 'status', 'exit_reason', 'filtered_out']
 
-    async def save_results_async(self, results: List[OptimizationResult], filename: str):
-        """Асинхронне збереження результатів"""
-        fieldnames = [
-            'rank', 'config_id', 'strategy_name', 'total_trades', 'win_rate',
-            'avg_pnl', 'total_pnl', 'profit_factor', 'max_drawdown', 'sharpe_ratio',
-            'avg_hold_time', 'filtered_out', 'best_trade', 'worst_trade', 'execution_time'
-        ]
+        async with aiofiles.open(temp_file, 'w', encoding='utf-8', newline='') as f:
+            writer_data = []
+            # Записуємо заголовок
+            writer_data.append(';'.join(fieldnames))
 
-        # Додаємо всі можливі параметри
-        all_param_names = set()
+            # Записуємо дані
+            for result in results:
+                row = [str(result.get(field, '')) for field in fieldnames]
+                writer_data.append(';'.join(row))
+
+            await f.write('\n'.join(writer_data))
+
+    async def optimize_ultra_fast(self, input_csv: str, max_configs: int = 500,
+                                  mode: str = 'ultra_fast', output_file: str = 'results.csv') -> List[Dict]:
+        """Ультра-швидка оптимізація"""
+
+        logging.warning(f"Початок ультра-швидкої оптимізації:")
+        logging.warning(f"  - Файл сигналів: {input_csv}")
+        logging.warning(f"  - Максимум конфігурацій: {max_configs}")
+        logging.warning(f"  - Режим: {mode}")
+
+        start_time = time.time()
+
+        # 1. Завантаження сигналів
+        signals = self._load_signals_fast(input_csv)
+        logging.warning(f"Завантажено {len(signals)} сигналів")
+
+        if not signals:
+            logging.error("Немає валідних сигналів для оптимізації")
+            return []
+
+        # 2. Пакетне завантаження всіх даних одразу
+        logging.warning("Завантаження даних для всіх пар...")
+        pairs = list(set(s['pair'] for s in signals))
+
+        analyzer = OptimizedSignalAnalyzer(self.base_config, cache_size_mb=4096)
+
+        try:
+            all_data = await analyzer.fetch_all_data_batch(pairs, signals, self.base_config)
+            logging.warning(f"Завантажено дані для {len(all_data)} пар")
+        except Exception as e:
+            logging.error(f"Помилка завантаження даних: {e}")
+            return []
+
+        # 3. Генерація конфігурацій
+        configs = self.create_config_combinations(max_configs, mode)
+        logging.warning(f"Створено {len(configs)} конфігурацій для тестування")
+
+        self.perf_stats['total_configs'] = len(configs)
+
+        # 4. Паралельне тестування конфігурацій
+        semaphore = asyncio.Semaphore(self.max_concurrent)
+        temp_dir = os.path.splitext(output_file)[0] + '_temp'
+        os.makedirs(temp_dir, exist_ok=True)
+
+        tasks = []
+        for i, config in enumerate(configs):
+            config_id = f"{mode}_{i + 1:04d}"
+            temp_file = os.path.join(temp_dir, f"temp_{config_id}.csv")
+
+            task = asyncio.create_task(
+                self.test_single_config_vectorized(
+                    config, config_id, all_data, signals, semaphore, temp_file
+                )
+            )
+            tasks.append((task, config_id))
+
+        # 5. Збір результатів пакетами
+        logging.warning(f"Початок тестування {len(tasks)} конфігурацій...")
+        results = []
+        batch_size = 100
+
+        for i in range(0, len(tasks), batch_size):
+            batch = tasks[i:i + batch_size]
+            batch_results = await asyncio.gather(
+                *(task for task, _ in batch), return_exceptions=True
+            )
+
+            for (task, config_id), result in zip(batch, batch_results):
+                if isinstance(result, Exception):
+                    logging.warning(f"Помилка в {config_id}: {result}")
+                    self.perf_stats['failed_tests'] += 1
+                elif result is not None:
+                    self.perf_stats['successful_tests'] += 1
+                    results.append(result)
+
+                    # Логування результату
+                    metrics = result['metrics']
+                    logging.warning(f"{config_id}: Trades={metrics['total_trades']}, "
+                                    f"Win={metrics['win_rate']:.1f}%, "
+                                    f"AvgPnL={metrics['avg_pnl']:.3f}%")
+                else:
+                    self.perf_stats['failed_tests'] += 1
+
+            progress = (i + len(batch)) / len(tasks) * 100
+            logging.warning(f"Прогрес: {progress:.1f}%")
+
+            # Очищення пам'яті кожні 200 конфігурацій
+            if i % 200 == 0:
+                gc.collect()
+
+        # 6. Сортування та збереження результатів
+        results.sort(key=lambda x: x['metrics']['avg_pnl'], reverse=True)
+
+        total_time = time.time() - start_time
+        logging.warning(f"Оптимізація завершена за {total_time:.2f} секунд")
+        logging.warning(f"Успішно протестовано: {len(results)} конфігурацій")
+
+        # 7. Збереження топ результатів
+        if results:
+            await self._save_final_results(results[:50], output_file)
+            self._print_top_results(results[:10])
+
+        return results
+
+    def _load_signals_fast(self, filename: str) -> List[Dict]:
+        """Швидке завантаження сигналів"""
+        signals = []
+        with open(filename, 'r', encoding='utf-8') as f:
+            reader = csv.DictReader(f, delimiter=';')
+            for row in reader:
+                pair = row['Pair'].replace('/', '')
+                if row.get('Status') == 'open' and pair not in self.banned_pairs:
+                    signals.append({
+                        'pair': pair,
+                        'direction': row['Direction'],
+                        'time': row['Signal_Time'],
+                        'rsi': float(row['RSI_5m'].replace(',', '.')),
+                        'rsi_sma': float(row['RSI_SMA_5m'].replace(',', '.'))
+                    })
+        return signals
+
+    async def _save_final_results(self, results: List[Dict], filename: str):
+        """Збереження фінальних результатів"""
+        fieldnames = ['rank', 'config_id', 'total_trades', 'win_rate', 'avg_pnl',
+                      'total_pnl', 'profit_factor', 'max_drawdown', 'execution_time']
+
+        # Додаємо параметри
+        all_params = set()
         for result in results:
-            all_param_names.update(result.parameters.keys())
-
-        fieldnames.extend(sorted(all_param_names))
+            all_params.update(result['parameters'].keys())
+        fieldnames.extend(sorted(all_params))
 
         async with aiofiles.open(filename, 'w', encoding='utf-8', newline='') as f:
-            # Записуємо заголовок
             await f.write(';'.join(fieldnames) + '\n')
 
-            # Записуємо результати
             for rank, result in enumerate(results, 1):
+                metrics = result['metrics']
                 row = {
                     'rank': rank,
-                    'config_id': result.config_id,
-                    'strategy_name': result.strategy_name,
-                    'total_trades': result.total_trades,
-                    'win_rate': round(result.win_rate, 2),
-                    'avg_pnl': round(result.avg_pnl, 4),
-                    'total_pnl': round(result.total_pnl, 2),
-                    'profit_factor': round(result.profit_factor, 2),
-                    'max_drawdown': round(result.max_drawdown, 2),
-                    'sharpe_ratio': round(result.sharpe_ratio, 3),
-                    'avg_hold_time': round(result.avg_hold_time, 2),
-                    'filtered_out': result.filtered_out,
-                    'best_trade': round(result.best_trade, 2),
-                    'worst_trade': round(result.worst_trade, 2),
-                    'execution_time': round(result.execution_time, 3)
+                    'config_id': result['config_id'],
+                    'total_trades': metrics['total_trades'],
+                    'win_rate': round(metrics['win_rate'], 2),
+                    'avg_pnl': round(metrics['avg_pnl'], 4),
+                    'total_pnl': round(metrics['total_pnl'], 2),
+                    'profit_factor': round(metrics['profit_factor'], 2),
+                    'max_drawdown': round(metrics['max_drawdown'], 2),
+                    'execution_time': round(result['execution_time'], 3)
                 }
 
                 # Додаємо параметри
-                for param_name in all_param_names:
-                    row[param_name] = result.parameters.get(param_name, '')
+                for param in all_params:
+                    row[param] = result['parameters'].get(param, '')
 
-                # Формуємо рядок
-                row_values = []
-                for field in fieldnames:
-                    value = row.get(field, '')
-                    if isinstance(value, list):
-                        value = str(value)
-                    row_values.append(str(value))
-
+                row_values = [str(row.get(field, '')) for field in fieldnames]
                 await f.write(';'.join(row_values) + '\n')
 
-    def print_top_results(self, results: List[OptimizationResult], top_n: int = 10):
-        """Вивід топ результатів"""
-        print(f"\n{'=' * 80}")
-        print(f"ТОП-{top_n} НАЙКРАЩИХ КОНФІГУРАЦІЙ")
-        print(f"{'=' * 80}")
+    def _print_top_results(self, results: List[Dict], top_n: int = 10):
+        """Виведення топ результатів"""
+        logging.warning(f"\n{'=' * 80}")
+        logging.warning(f"ТОП-{top_n} НАЙКРАЩИХ КОНФІГУРАЦІЙ")
+        logging.warning(f"{'=' * 80}")
 
         for i, result in enumerate(results[:top_n], 1):
-            params = result.parameters
-            print(f"\n#{i} - {result.config_id}")
-            print(f"Угод: {result.total_trades} | Win Rate: {result.win_rate:.1f}% | "
-                  f"Avg PnL: {result.avg_pnl:.3f}% | Total PnL: {result.total_pnl:.2f}%")
-            print(f"Profit Factor: {result.profit_factor:.2f} | Max DD: {result.max_drawdown:.2f}% | "
-                  f"Sharpe: {result.sharpe_ratio:.3f}")
-            print(f"Час виконання: {result.execution_time:.3f}с | Відфільтровано: {result.filtered_out}")
+            metrics = result['metrics']
+            params = result['parameters']
 
-            # Топ параметри
-            important_params = ['stop_loss', 'take_profit', 'use_trailing_stop',
-                                'trailing_stop_activation', 'trailing_stop_distance',
-                                'long_exit_zone', 'short_exit_zone', 'secondary_timeframes']
+            logging.warning(f"\n#{i} - {result['config_id']}")
+            logging.warning(f"Угод: {metrics['total_trades']} | "
+                            f"Win Rate: {metrics['win_rate']:.1f}% | "
+                            f"Avg PnL: {metrics['avg_pnl']:.3f}%")
+            logging.warning(f"Total PnL: {metrics['total_pnl']:.2f}% | "
+                            f"Profit Factor: {metrics['profit_factor']:.2f} | "
+                            f"Max DD: {metrics['max_drawdown']:.2f}%")
 
+            # Ключові параметри
+            key_params = ['stop_loss', 'take_profit', 'use_trailing_stop', 'long_exit_zone']
             param_str = []
-            for param in important_params:
+            for param in key_params:
                 if param in params:
                     param_str.append(f"{param}={params[param]}")
 
             if param_str:
-                print(f"Ключові параметри: {' | '.join(param_str[:4])}")  # Показуємо перші 4
+                logging.warning(f"Параметри: {' | '.join(param_str[:4])}")
 
-    def save_best_config_to_file(self, best_result: OptimizationResult, filename: str = None):
-        """Зберігає найкращу конфігурацію у файл"""
-        if filename is None:
-            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-            filename = f'best_config_{timestamp}.json'
 
-        # Застосовуємо найкращі параметри до базової конфігурації
-        best_config = self.apply_config_to_base(best_result.parameters)
-
-        # Додаємо метадані
-        best_config['optimization_metadata'] = {
-            'config_id': best_result.config_id,
-            'strategy_name': best_result.strategy_name,
-            'performance_metrics': {
-                'avg_pnl': best_result.avg_pnl,
-                'win_rate': best_result.win_rate,
-                'total_trades': best_result.total_trades,
-                'profit_factor': best_result.profit_factor,
-                'max_drawdown': best_result.max_drawdown,
-                'sharpe_ratio': best_result.sharpe_ratio
-            },
-            'optimization_date': datetime.now().isoformat(),
-            'execution_time': best_result.execution_time
-        }
-
-        with open(filename, 'w', encoding='utf-8') as f:
-            json.dump(best_config, f, indent=2, ensure_ascii=False)
-
-        logger.info(f"Найкращу конфігурацію збережено у файл: {filename}")
-        return filename
-
-    def analyze_parameter_impact(self, results: List[OptimizationResult]) -> Dict[str, Any]:
-        """Аналіз впливу параметрів на результат"""
-        if not results:
-            return {}
-
-        # Збираємо всі параметри
-        all_params = set()
-        for result in results:
-            all_params.update(result.parameters.keys())
-
-        param_analysis = {}
-
-        for param in all_params:
-            # Групуємо результати по значенням параметра
-            groups = {}
-            for result in results:
-                if param in result.parameters:
-                    value = str(result.parameters[param])
-                    if value not in groups:
-                        groups[value] = []
-                    groups[value].append(result.avg_pnl)
-
-            if len(groups) > 1:  # Має сенс аналізувати тільки якщо є різні значення
-                # Обчислюємо статистику для кожного значення
-                value_stats = {}
-                for value, pnls in groups.items():
-                    if pnls:
-                        value_stats[value] = {
-                            'avg_pnl': np.mean(pnls),
-                            'std_pnl': np.std(pnls),
-                            'count': len(pnls),
-                            'max_pnl': np.max(pnls),
-                            'min_pnl': np.min(pnls)
-                        }
-
-                # Знаходимо найкраще і найгірше значення
-                if value_stats:
-                    best_value = max(value_stats.keys(), key=lambda x: value_stats[x]['avg_pnl'])
-                    worst_value = min(value_stats.keys(), key=lambda x: value_stats[x]['avg_pnl'])
-
-                    param_analysis[param] = {
-                        'impact_range': value_stats[best_value]['avg_pnl'] - value_stats[worst_value]['avg_pnl'],
-                        'best_value': best_value,
-                        'worst_value': worst_value,
-                        'best_avg_pnl': value_stats[best_value]['avg_pnl'],
-                        'worst_avg_pnl': value_stats[worst_value]['avg_pnl'],
-                        'value_stats': value_stats
-                    }
-
-        # Сортуємо параметри за впливом
-        sorted_params = sorted(param_analysis.items(),
-                               key=lambda x: x[1]['impact_range'], reverse=True)
-
-        return {
-            'parameter_impact': dict(sorted_params),
-            'most_impactful': sorted_params[0] if sorted_params else None,
-            'analysis_summary': {
-                'total_parameters_analyzed': len(param_analysis),
-                'total_configurations': len(results),
-                'avg_performance_range': np.mean([p[1]['impact_range'] for p in sorted_params]) if sorted_params else 0
-            }
-        }
-
-    def print_parameter_analysis(self, analysis: Dict[str, Any], top_n: int = 5):
-        """Виводить аналіз впливу параметрів"""
-        if not analysis or 'parameter_impact' not in analysis:
-            print("Недостатньо даних для аналізу параметрів")
-            return
-
-        print(f"\n{'=' * 80}")
-        print("АНАЛІЗ ВПЛИВУ ПАРАМЕТРІВ")
-        print(f"{'=' * 80}")
-
-        param_impact = analysis['parameter_impact']
-        summary = analysis['analysis_summary']
-
-        print(f"Проаналізовано {summary['total_parameters_analyzed']} параметрів")
-        print(f"на основі {summary['total_configurations']} конфігурацій")
-        print(f"Середній діапазон впливу: {summary['avg_performance_range']:.3f}%")
-
-        print(f"\nТОП-{min(top_n, len(param_impact))} НАЙВПЛИВОВІШИХ ПАРАМЕТРІВ:")
-        print("-" * 80)
-
-        for i, (param, data) in enumerate(list(param_impact.items())[:top_n], 1):
-            print(f"\n#{i}. {param}")
-            print(f"   Діапазон впливу: {data['impact_range']:.3f}%")
-            print(f"   Найкраще значення: {data['best_value']} (PnL: {data['best_avg_pnl']:.3f}%)")
-            print(f"   Найгірше значення: {data['worst_value']} (PnL: {data['worst_avg_pnl']:.3f}%)")
-
-            # Показуємо топ-3 значення для цього параметра
-            value_stats = data['value_stats']
-            sorted_values = sorted(value_stats.items(),
-                                   key=lambda x: x[1]['avg_pnl'], reverse=True)[:3]
-
-            print(f"   Топ значення:")
-            for j, (value, stats) in enumerate(sorted_values, 1):
-                print(f"     {j}. {value}: {stats['avg_pnl']:.3f}% (тестів: {stats['count']})")
-
-    def get_performance_summary(self) -> Dict[str, Any]:
-        """Отримання статистики виконання"""
-        process = psutil.Process()
-        memory_mb = process.memory_info().rss / 1024 / 1024
-
-        self.perf_stats['memory_usage_mb'] = memory_mb
-
-        return {
-            'total_configs_tested': self.perf_stats['total_configs'],
-            'successful_tests': self.perf_stats['successful_tests'],
-            'failed_tests': self.perf_stats['failed_tests'],
-            'success_rate': (self.perf_stats['successful_tests'] / max(1, self.perf_stats['total_configs'])) * 100,
-            'avg_execution_time': self.perf_stats['avg_execution_time'],
-            'memory_usage_mb': memory_mb,
-            'cpu_percent': psutil.cpu_percent(),
-        }
-
-    async def optimize_async(self, input_csv: str, max_configs: int = 500,
-                             strategy_type: str = 'random', mode: str = 'balanced',
-                             output_file: str = 'optimization_results.csv',
-                             top_n_save: int = 50) -> List[OptimizationResult]:
-        """Головний метод асинхронної оптимізації"""
-
-        logger.info(f"Початок оптимізації:")
-        logger.info(f"  - Файл сигналів: {input_csv}")
-        logger.info(f"  - Максимум конфігурацій: {max_configs}")
-        logger.info(f"  - Стратегія: {strategy_type}")
-        logger.info(f"  - Режим: {mode}")
-        logger.info(f"  - Файл результатів: {output_file}")
-
-        start_time = time.time()
-
-        # Завантажуємо сигнали
-        try:
-            analyzer = SignalAnalyzer(self.base_config)
-            signals = analyzer.read_signals_csv(input_csv)
-            logger.info(f"Завантажено {len(signals)} сигналів")
-
-            if not signals:
-                logger.error("Немає валідних сигналів для оптимізації")
-                return []
-
-        except Exception as e:
-            logger.error(f"Помилка завантаження сигналів: {e}")
-            return []
-
-        # Генеруємо конфігурації
-        configs = self.create_config_combinations(max_configs, strategy_type, mode)
-        logger.info(f"Створено {len(configs)} конфігурацій для тестування")
-
-        if not configs:
-            logger.error("Немає валідних конфігурацій для тестування")
-            return []
-
-        # Оновлюємо статистику
-        self.perf_stats['total_configs'] = len(configs)
-
-        # Створюємо семафор для обмеження одночасних завдань
-        semaphore = asyncio.Semaphore(self.max_concurrent)
-
-        # Створюємо завдання для тестування
-        tasks = []
-        for i, config in enumerate(configs):
-            config_id = f"{strategy_type}_{mode}_{i:04d}"
-            task = asyncio.create_task(
-                self.test_single_config(config, config_id, signals, semaphore)
-            )
-            tasks.append(task)
-
-        # Виконуємо тестування з прогрес-баром
-        logger.info(f"Початок тестування {len(tasks)} конфігурацій...")
-
-        results = []
-        completed = 0
-        batch_size = 50  # Оброблюємо батчами для контролю пам'яті
-
-        for i in range(0, len(tasks), batch_size):
-            batch = tasks[i:i + batch_size]
-            batch_results = await asyncio.gather(*batch, return_exceptions=True)
-
-            for result in batch_results:
-                if isinstance(result, Exception):
-                    logger.error(f"Помилка в батчі: {result}")
-                    self.perf_stats['failed_tests'] += 1
-                elif result is not None:
-                    results.append(result)
-                    self.perf_stats['successful_tests'] += 1
-                else:
-                    self.perf_stats['failed_tests'] += 1
-
-                completed += 1
-
-            # Показуємо прогрес
-            progress = (completed / len(tasks)) * 100
-            logger.info(f"Прогрес: {progress:.1f}% ({completed}/{len(tasks)})")
-
-            # Очищуємо пам'ять
-            if i % (batch_size * 2) == 0:
-                gc.collect()
-
-        # Сортуємо результати за середнім PnL
-        results.sort(key=lambda x: x.avg_pnl, reverse=True)
-
-        # Обчислюємо статистику виконання
-        total_time = time.time() - start_time
-        self.perf_stats['avg_execution_time'] = total_time / len(results) if results else 0
-
-        logger.info(f"Оптимізація завершена за {total_time:.2f} секунд")
-        logger.info(f"Успішно протестовано: {len(results)} конфігурацій")
-
-        # Зберігаємо результати
-        if results:
-            top_results = results[:top_n_save]
-            await self.save_results_async(top_results, output_file)
-            logger.info(f"Збережено топ-{len(top_results)} результатів у {output_file}")
-
-            # Виводимо топ результати
-            self.print_top_results(results, min(10, len(results)))
-
-            # Виводимо статистику
-            perf_summary = self.get_performance_summary()
-            logger.info("Статистика виконання:")
-            for key, value in perf_summary.items():
-                logger.info(f"  {key}: {value}")
-
-        return results
-
-    async def run_multi_strategy_optimization(self, input_csv: str,
-                                              strategies: List[str] = None,
-                                              modes: List[str] = None,
-                                              configs_per_strategy: int = 200) -> Dict[str, List[OptimizationResult]]:
-        """Запуск оптимізації з кількома стратегіями"""
-
-        if strategies is None:
-            strategies = ['random', 'genetic', 'grid_search']
-        if modes is None:
-            modes = ['fast', 'balanced']
-
-        all_results = {}
-
-        for strategy in strategies:
-            for mode in modes:
-                key = f"{strategy}_{mode}"
-                logger.info(f"Запуск оптимізації: {key}")
-
-                output_file = f"optimization_{key}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
-
-                results = await self.optimize_async(
-                    input_csv=input_csv,
-                    max_configs=configs_per_strategy,
-                    strategy_type=strategy,
-                    mode=mode,
-                    output_file=output_file,
-                    top_n_save=50
-                )
-
-                all_results[key] = results
-
-                # Пауза між стратегіями
-                await asyncio.sleep(2)
-                gc.collect()
-
-        # Зберігаємо зведений звіт
-        await self.save_combined_report(all_results)
-
-        return all_results
-
-    async def save_combined_report(self, all_results: Dict[str, List[OptimizationResult]]):
-        """Збереження зведеного звіту"""
-        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-        filename = f"combined_optimization_report_{timestamp}.csv"
-
-        # Об'єднуємо всі результати
-        combined_results = []
-        for strategy_mode, results in all_results.items():
-            for result in results[:10]:  # Топ-10 з кожної стратегії
-                result.strategy_name = f"{strategy_mode}_{result.strategy_name}"
-                combined_results.append(result)
-
-        # Сортуємо за avg_pnl
-        combined_results.sort(key=lambda x: x.avg_pnl, reverse=True)
-
-        await self.save_results_async(combined_results, filename)
-        logger.info(f"Зведений звіт збережено: {filename}")
-
-        # Виводимо найкращі результати по кожній стратегії
-        print(f"\n{'=' * 100}")
-        print("ЗВЕДЕНИЙ ЗВІТ ПО СТРАТЕГІЯМ")
-        print(f"{'=' * 100}")
-
-        for strategy_mode, results in all_results.items():
-            if results:
-                best = results[0]
-                print(f"\n{strategy_mode.upper()}:")
-                print(f"  Найкращий результат: Avg PnL={best.avg_pnl:.3f}%, "
-                      f"Win Rate={best.win_rate:.1f}%, Угод={best.total_trades}")
-                print(f"  Всього протестовано: {len(results)} конфігурацій")
-
-
+# Головна функція для запуску
 async def main():
     """Головна функція запуску оптимізатора"""
-    parser = argparse.ArgumentParser(description='Асинхронний оптимізатор для Enhanced Signal Analyzer')
-
+    parser = argparse.ArgumentParser(description='Ультра-швидкий оптимізатор Enhanced Analyzer')
     parser.add_argument('input_csv', help='CSV файл з сигналами')
     parser.add_argument('-c', '--config', default='updated_analyzer_config.json',
                         help='Базовий конфіг файл')
     parser.add_argument('-n', '--max-configs', type=int, default=500,
-                        help='Максимальна кількість конфігурацій для тестування')
-    parser.add_argument('-s', '--strategy', default='random',
-                        choices=['random', 'genetic', 'grid_search'],
-                        help='Стратегія генерації конфігурацій')
-    parser.add_argument('-m', '--mode', default='balanced',
-                        choices=['fast', 'balanced', 'thorough', 'ultra_fast'],
-                        help='Режим оптимізації (швидкість vs точність)')
-    parser.add_argument('-o', '--output', default='optimization_results.csv',
-                        help='Файл для збереження результатів')
-    parser.add_argument('--concurrent', type=int, default=20,
+                        help='Максимальна кількість конфігурацій')
+    parser.add_argument('-m', '--mode', default='ultra_fast',
+                        choices=['ultra_fast', 'balanced'],
+                        help='Режим оптимізації')
+    parser.add_argument('-o', '--output', default='ultra_fast_results.csv',
+                        help='Файл для результатів')
+    parser.add_argument('--concurrent', type=int, default=50,
                         help='Максимальна кількість одночасних завдань')
-    parser.add_argument('--top-n', type=int, default=50,
-                        help='Кількість топ результатів для збереження')
-    parser.add_argument('--multi-strategy', action='store_true',
-                        help='Запустити оптимізацію з кількома стратегіями')
 
     args = parser.parse_args()
 
-    # Перевіряємо існування файлів
-    if not os.path.exists(args.input_csv):
-        logger.error(f"Файл сигналів не знайдено: {args.input_csv}")
-        return
-
-    if not os.path.exists(args.config):
-        logger.warning(f"Конфіг файл не знайдено: {args.config}, буде створено стандартний")
-
-    # Створюємо оптимізатор
-    optimizer = AsyncConfigOptimizer(
-        base_config_file=args.config,
-        max_concurrent=args.concurrent,
-        use_fast_mode=args.mode in ['fast', 'ultra_fast']
+    # Налаштування логування
+    logging.basicConfig(
+        level=logging.WARNING,
+        format='%(asctime)s - %(levelname)s - %(message)s',
+        handlers=[
+            logging.FileHandler('ultra_fast_optimizer.log', encoding='utf-8'),
+            logging.StreamHandler()
+        ]
     )
 
-    logger.info("Початок оптимізації Enhanced Signal Analyzer")
-    logger.info(f"CPU cores: {psutil.cpu_count()}")
-    logger.info(f"Доступна RAM: {psutil.virtual_memory().total // (1024 ** 3)} GB")
+    if not os.path.exists(args.input_csv):
+        logging.error(f"Файл сигналів не знайдено: {args.input_csv}")
+        return
+
+    # Ініціалізація оптимізатора
+    optimizer = UltraFastOptimizer(
+        base_config_file=args.config,
+        max_concurrent=args.concurrent
+    )
+
+    logging.warning("Початок ультра-швидкої оптимізації")
+    logging.warning(f"CPU cores: {psutil.cpu_count()}")
+    logging.warning(f"Доступна RAM: {psutil.virtual_memory().total // (1024 ** 3)} GB")
+    logging.warning(f"Concurrent tasks: {args.concurrent}")
 
     try:
-        if args.multi_strategy:
-            # Багатостратегійна оптимізація
-            strategies = ['random', 'genetic']
-            modes = ['fast', 'balanced'] if args.mode != 'ultra_fast' else ['ultra_fast']
+        results = await optimizer.optimize_ultra_fast(
+            input_csv=args.input_csv,
+            max_configs=args.max_configs,
+            mode=args.mode,
+            output_file=args.output
+        )
 
-            configs_per_strategy = max(100, args.max_configs // (len(strategies) * len(modes)))
-
-            results = await optimizer.run_multi_strategy_optimization(
-                input_csv=args.input_csv,
-                strategies=strategies,
-                modes=modes,
-                configs_per_strategy=configs_per_strategy
-            )
-
-            # Виводимо загальну статистику
-            total_configs = sum(len(r) for r in results.values())
-            logger.info(f"Загалом протестовано {total_configs} конфігурацій")
-
+        if results:
+            logging.warning("\nОптимізація успішно завершена!")
+            logging.warning(f"Найкращий результат: Avg PnL = {results[0]['metrics']['avg_pnl']:.3f}%")
+            logging.warning(f"Результати збережено в: {args.output}")
         else:
-            # Одностратегійна оптимізація
-            results = await optimizer.optimize_async(
-                input_csv=args.input_csv,
-                max_configs=args.max_configs,
-                strategy_type=args.strategy,
-                mode=args.mode,
-                output_file=args.output,
-                top_n_save=args.top_n
-            )
-
-            if results:
-                logger.info("Оптимізація успішно завершена!")
-                logger.info(f"Найкращий результат: Avg PnL = {results[0].avg_pnl:.3f}%")
-            else:
-                logger.error("Оптимізація не дала результатів")
+            logging.error("Оптимізація не дала результатів")
 
     except KeyboardInterrupt:
-        logger.info("Оптимізацію перервано користувачем")
+        logging.warning("Оптимізацію перервано користувачем")
     except Exception as e:
-        logger.error(f"Критична помилка оптимізації: {e}", exc_info=True)
+        logging.error(f"Критична помилка: {e}", exc_info=True)
     finally:
-        # Очищення пам'яті
         gc.collect()
-
-        # Фінальна статистика
-        final_stats = optimizer.get_performance_summary()
-        logger.info("Фінальна статистика:")
-        for key, value in final_stats.items():
-            logger.info(f"  {key}: {value}")
+        final_memory = psutil.virtual_memory().percent
+        logging.warning(f"Використання пам'яті: {final_memory:.1f}%")
 
 
 if __name__ == "__main__":
-    # Налаштування asyncio для Windows
+    # Налаштування для Windows
     if os.name == 'nt':
         asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
 
+    # Запуск
     asyncio.run(main())
