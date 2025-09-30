@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Високопродуктивний оптимізатор для Enhanced Analyzer
+Високопродуктивний оптимізатор для Enhanced Analyzer з повними фільтраціями
 Основні оптимізації:
 1. Кешування даних на рівні пар з розумним управлінням пам'яттю
 2. Паралельні обчислення індикаторів з numpy
@@ -8,6 +8,7 @@
 4. Оптимізовані алгоритми пошуку сигналів
 5. Мінімізація I/O операцій
 6. Ефективне управління ресурсами
+7. ПОВНІ ФІЛЬТРАЦІЇ як у першій версії
 """
 
 import gc
@@ -211,7 +212,7 @@ class HighPerformanceDataCache:
 
 
 class OptimizedSignalAnalyzer:
-    """Оптимізований аналізатор сигналів"""
+    """Оптимізований аналізатор сигналів з повними фільтраціями"""
 
     def __init__(self, config: Dict, cache_size_mb: int = 2048):
         exchange_name = config.get('exchange', 'bybit')
@@ -364,9 +365,94 @@ class OptimizedSignalAnalyzer:
 
         return df
 
+    def check_secondary_tf_filter(self, signal: Dict, data: Dict[str, pd.DataFrame], config: Dict) -> Tuple[bool, str]:
+        """Перевірка фільтрів вторинних таймфреймів - КЛЮЧОВА ДОДАНА ФІЛЬТРАЦІЯ"""
+        try:
+            secondary_tfs = config['timeframe_settings']['secondary_timeframes']
+            if not secondary_tfs:
+                return True, "No secondary timeframes"
+
+            signal_time = self._parse_time_fast(signal['time'])
+            direction = signal['direction'].lower()
+
+            secondary_filter = config['secondary_tf_filter']
+
+            for tf in secondary_tfs:
+                if tf not in data:
+                    continue
+
+                df = data[tf]
+                if df.empty:
+                    continue
+
+                # Знаходимо найближчу свічку
+                time_diffs = abs((df['datetime'] - signal_time).dt.total_seconds())
+                closest_idx = time_diffs.idxmin()
+
+                if closest_idx < 10:  # Потрібна історія
+                    continue
+
+                current_rsi = df.loc[closest_idx, 'rsi']
+                current_rsi_sma = df.loc[closest_idx, 'rsi_sma']
+
+                # Фільтр 1: Перевірка зони входу на вторинному TF
+                if direction == 'long':
+                    if current_rsi > secondary_filter['long_enter_zone_mid_tf']:
+                        return False, f"Long RSI too high on {tf}: {current_rsi:.1f}"
+                else:  # short
+                    if current_rsi < secondary_filter['short_enter_zone_mid_tf']:
+                        return False, f"Short RSI too low on {tf}: {current_rsi:.1f}"
+
+                # Фільтр 2: Перевірка екстремальних значень RSI
+                rsi_extreme_threshold = secondary_filter['rsi_extreme_threshold']
+                if direction == 'long' and current_rsi < rsi_extreme_threshold:
+                    return False, f"Long RSI too extreme on {tf}: {current_rsi:.1f}"
+                elif direction == 'short' and current_rsi > (100 - rsi_extreme_threshold):
+                    return False, f"Short RSI too extreme on {tf}: {current_rsi:.1f}"
+
+                # Фільтр 3: Перевірка зміни SMA
+                sma_periods = secondary_filter['sma_change_periods']
+                sma_threshold = secondary_filter['sma_change_threshold']
+
+                if closest_idx >= sma_periods:
+                    sma_start = df.loc[closest_idx - sma_periods, 'rsi_sma']
+                    sma_change_pct = abs((current_rsi_sma - sma_start) / sma_start * 100)
+
+                    if sma_change_pct < sma_threshold:
+                        return False, f"SMA change too small on {tf}: {sma_change_pct:.2f}%"
+
+                # Фільтр 4: Cross lookback аналіз
+                lookback_periods = secondary_filter['cross_lookback_periods']
+                if closest_idx >= lookback_periods:
+                    lookback_data = df.loc[closest_idx - lookback_periods:closest_idx]
+
+                    # Перевіряємо чи були перехрещення RSI та RSI_SMA
+                    rsi_values = lookback_data['rsi'].values
+                    sma_values = lookback_data['rsi_sma'].values
+
+                    crosses = 0
+                    for i in range(1, len(rsi_values)):
+                        if ((rsi_values[i - 1] <= sma_values[i - 1] and rsi_values[i] > sma_values[i]) or
+                                (rsi_values[i - 1] >= sma_values[i - 1] and rsi_values[i] < sma_values[i])):
+                            crosses += 1
+
+                    # Якщо занадто багато перехрещень - сигнал може бути ненадійним
+                    if crosses > 3:
+                        return False, f"Too many crosses on {tf}: {crosses}"
+
+                    # Якщо немає жодного перехрещення - може не бути моменту
+                    if crosses == 0:
+                        return False, f"No momentum on {tf}: no crosses"
+
+            return True, "All secondary TF filters passed"
+
+        except Exception as e:
+            logging.warning(f"Помилка перевірки secondary TF filter: {e}")
+            return False, f"Filter error: {str(e)}"
+
 
 class UltraFastOptimizer:
-    """Ультра-швидкий оптимізатор з мінімальними накладними витратами"""
+    """Ультра-швидкий оптимізатор з повними фільтраціями"""
 
     def __init__(self, base_config_file: str = 'updated_analyzer_config.json', max_concurrent: int = 50):
         self.base_config = self._load_config_fast(base_config_file)
@@ -386,7 +472,7 @@ class UltraFastOptimizer:
             'memory_usage_mb': 0
         }
 
-        logging.warning(f"Ініціалізовано ультра-швидкий оптимізатор (concurrent: {max_concurrent})")
+        logging.warning(f"Ініціалізовано ультра-швидкий оптимізатор з фільтрацією (concurrent: {max_concurrent})")
         logging.warning(f"Заборонені пари: {len(self.banned_pairs)}")
 
     def _load_config_fast(self, config_file: str) -> Dict:
@@ -651,16 +737,18 @@ class UltraFastOptimizer:
                                             all_data: Dict[str, Dict[str, pd.DataFrame]],
                                             signals: List[Dict], semaphore: asyncio.Semaphore,
                                             temp_file: str) -> Optional[Dict]:
-        """Векторизоване тестування конфігурації"""
+        """Векторизоване тестування конфігурації з фільтрацією"""
 
         async with semaphore:
             start_time = time.time()
 
             try:
                 full_config = self.apply_config_to_base(config)
+                analyzer = OptimizedSignalAnalyzer(full_config)
 
-                # Паралельне тестування всіх сигналів
+                # Паралельне тестування всіх сигналів з фільтрацією
                 trade_results = []
+                filtered_count = 0
 
                 # Групуємо сигнали по парах
                 pair_signals = defaultdict(list)
@@ -673,14 +761,15 @@ class UltraFastOptimizer:
                 for pair, pair_signals_list in pair_signals.items():
                     pair_data = all_data[pair]
 
-                    # Тестуємо всі сигнали пари одразу
-                    pair_results = self._test_pair_signals_vectorized(
-                        pair_data, pair_signals_list, full_config
+                    # Тестуємо всі сигнали пари одразу з фільтрацією
+                    pair_results, pair_filtered = self._test_pair_signals_with_filtering(
+                        pair_data, pair_signals_list, full_config, analyzer
                     )
                     trade_results.extend(pair_results)
+                    filtered_count += pair_filtered
 
                 # Швидкий аналіз результатів
-                metrics = self._calculate_metrics_fast(trade_results)
+                metrics = self._calculate_metrics_fast(trade_results, filtered_count)
 
                 # Зберігаємо результати в тимчасовий файл
                 await self._save_temp_results(temp_file, trade_results)
@@ -698,17 +787,19 @@ class UltraFastOptimizer:
                 logging.warning(f"Помилка тестування конфігу {config_id}: {e}")
                 return None
 
-    def _test_pair_signals_vectorized(self, data: Dict[str, pd.DataFrame],
-                                      signals: List[Dict], config: Dict) -> List[Dict]:
-        """Векторизоване тестування сигналів для пари"""
+    def _test_pair_signals_with_filtering(self, data: Dict[str, pd.DataFrame],
+                                          signals: List[Dict], config: Dict,
+                                          analyzer: OptimizedSignalAnalyzer) -> Tuple[List[Dict], int]:
+        """Векторизоване тестування сигналів для пари з фільтрацією"""
 
         primary_tf = config['timeframe_settings']['primary_timeframe']
         df = data.get(primary_tf)
 
         if df is None or df.empty:
-            return []
+            return [], 0
 
         results = []
+        filtered_count = 0
 
         # Підготовка даних для векторизації
         prices = df['close'].values
@@ -720,16 +811,32 @@ class UltraFastOptimizer:
         trading_params = config['trading_parameters']
         rsi_params = config['rsi_parameters']
 
-        config_array = np.array([
-            trading_params['stop_loss'],
-            trading_params['trailing_stop_activation'],
-            trading_params['trailing_stop_distance'],
-            rsi_params['long_exit_zone'] if True else rsi_params['short_exit_zone'],
-            trading_params['max_hold_hours'] * 12  # 5m свічок в годині
-        ])
-
         for signal in signals:
-            signal_time = self._parse_time_fast(signal['time'])
+            # КЛЮЧОВА ФІЛЬТРАЦІЯ - перевірка secondary TF фільтрів
+            filter_passed, filter_reason = analyzer.check_secondary_tf_filter(signal, data, config)
+
+            if not filter_passed:
+                filtered_count += 1
+                # Зберігаємо відфільтровані сигнали для статистики
+                result = {
+                    'pair': signal['pair'],
+                    'direction': signal['direction'],
+                    'rsi': signal['rsi'],
+                    'signal_time': signal['time'],
+                    'entry_time_str': '',
+                    'exit_time_str': '',
+                    'entry_price': 0.0,
+                    'exit_price': 0.0,
+                    'pnl_percent': 0.0,
+                    'hold_time': 0.0,
+                    'status': 'Filtered',
+                    'exit_reason': filter_reason,
+                    'filtered_out': 1
+                }
+                results.append(result)
+                continue
+
+            signal_time = analyzer._parse_time_fast(signal['time'])
             direction = 1 if signal['direction'].lower() == 'long' else -1
 
             # Знаходимо індекс входу - конвертуємо все в datetime64
@@ -742,15 +849,17 @@ class UltraFastOptimizer:
                 continue
 
             # Налаштовуємо параметри для напряму
-            config_for_signal = config_array.copy()
-            if direction == 1:  # Long
-                config_for_signal[3] = rsi_params['long_exit_zone']
-            else:  # Short
-                config_for_signal[3] = rsi_params['short_exit_zone']
+            config_array = np.array([
+                trading_params['stop_loss'],
+                trading_params['trailing_stop_activation'],
+                trading_params['trailing_stop_distance'],
+                rsi_params['long_exit_zone'] if direction == 1 else rsi_params['short_exit_zone'],
+                trading_params['max_hold_hours'] * 12  # 5m свічок в годині
+            ])
 
             # Векторизований аналіз угоди
             exit_price, pnl, exit_idx, exit_reason = vectorized_trade_analysis(
-                prices, rsi, rsi_sma, entry_idx, direction, config_for_signal
+                prices, rsi, rsi_sma, entry_idx, direction, config_array
             )
 
             # Формуємо результат
@@ -782,7 +891,7 @@ class UltraFastOptimizer:
             }
             results.append(result)
 
-        return results
+        return results, filtered_count
 
     def _parse_time_fast(self, time_str: str) -> pd.Timestamp:
         """Швидкий парсинг часу з перевіркою типів"""
@@ -794,17 +903,21 @@ class UltraFastOptimizer:
             except:
                 return pd.Timestamp.now()
 
-    def _calculate_metrics_fast(self, results: List[Dict]) -> Dict:
-        """Швидке обчислення метрик"""
-        if not results:
+    def _calculate_metrics_fast(self, results: List[Dict], filtered_count: int = 0) -> Dict:
+        """Швидке обчислення метрик з урахуванням фільтрації"""
+        # Розділяємо на торговані та відфільтровані
+        traded_results = [r for r in results if not r.get('filtered_out', False)]
+
+        if not traded_results:
             return {
                 'total_trades': 0, 'win_rate': 0.0, 'avg_pnl': 0.0,
-                'total_pnl': 0.0, 'profit_factor': 0.0, 'max_drawdown': 0.0
+                'total_pnl': 0.0, 'profit_factor': 0.0, 'max_drawdown': 0.0,
+                'filtered_out': filtered_count, 'best_trade': 0.0, 'worst_trade': 0.0
             }
 
-        pnls = np.array([r['pnl_percent'] for r in results])
+        pnls = np.array([r['pnl_percent'] for r in traded_results])
 
-        total_trades = len(results)
+        total_trades = len(traded_results)
         profitable_trades = np.sum(pnls > 0)
         win_rate = (profitable_trades / total_trades * 100) if total_trades > 0 else 0
         avg_pnl = np.mean(pnls)
@@ -831,7 +944,8 @@ class UltraFastOptimizer:
             'profit_factor': profit_factor,
             'max_drawdown': max_drawdown,
             'best_trade': np.max(pnls) if len(pnls) > 0 else 0,
-            'worst_trade': np.min(pnls) if len(pnls) > 0 else 0
+            'worst_trade': np.min(pnls) if len(pnls) > 0 else 0,
+            'filtered_out': filtered_count
         }
 
     async def _save_temp_results(self, temp_file: str, results: List[Dict]):
@@ -857,9 +971,9 @@ class UltraFastOptimizer:
 
     async def optimize_ultra_fast(self, input_csv: str, max_configs: int = 500,
                                   mode: str = 'ultra_fast', output_file: str = 'results.csv') -> List[Dict]:
-        """Ультра-швидка оптимізація"""
+        """Ультра-швидка оптимізація з фільтрацією"""
 
-        logging.warning(f"Початок ультра-швидкої оптимізації:")
+        logging.warning(f"Початок ультра-швидкої оптимізації з фільтрацією:")
         logging.warning(f"  - Файл сигналів: {input_csv}")
         logging.warning(f"  - Максимум конфігурацій: {max_configs}")
         logging.warning(f"  - Режим: {mode}")
@@ -900,7 +1014,7 @@ class UltraFastOptimizer:
 
         tasks = []
         for i, config in enumerate(configs):
-            config_id = f"{mode}_{i + 1:04d}"
+            config_id = f"{mode}_filtered_{i + 1:04d}"
             temp_file = os.path.join(temp_dir, f"temp_{config_id}.csv")
 
             task = asyncio.create_task(
@@ -911,7 +1025,7 @@ class UltraFastOptimizer:
             tasks.append((task, config_id))
 
         # 5. Збір результатів пакетами
-        logging.warning(f"Початок тестування {len(tasks)} конфігурацій...")
+        logging.warning(f"Початок тестування {len(tasks)} конфігурацій з фільтрацією...")
         results = []
         batch_size = 100
 
@@ -929,9 +1043,10 @@ class UltraFastOptimizer:
                     self.perf_stats['successful_tests'] += 1
                     results.append(result)
 
-                    # Логування результату
+                    # Логування результату з фільтрацією
                     metrics = result['metrics']
                     logging.warning(f"{config_id}: Trades={metrics['total_trades']}, "
+                                    f"Filtered={metrics['filtered_out']}, "
                                     f"Win={metrics['win_rate']:.1f}%, "
                                     f"AvgPnL={metrics['avg_pnl']:.3f}%")
                 else:
@@ -978,7 +1093,8 @@ class UltraFastOptimizer:
     async def _save_final_results(self, results: List[Dict], filename: str):
         """Збереження фінальних результатів"""
         fieldnames = ['rank', 'config_id', 'total_trades', 'win_rate', 'avg_pnl',
-                      'total_pnl', 'profit_factor', 'max_drawdown', 'execution_time']
+                      'total_pnl', 'profit_factor', 'max_drawdown', 'filtered_out',
+                      'best_trade', 'worst_trade', 'execution_time']
 
         # Додаємо параметри
         all_params = set()
@@ -1000,6 +1116,9 @@ class UltraFastOptimizer:
                     'total_pnl': round(metrics['total_pnl'], 2),
                     'profit_factor': round(metrics['profit_factor'], 2),
                     'max_drawdown': round(metrics['max_drawdown'], 2),
+                    'filtered_out': metrics['filtered_out'],
+                    'best_trade': round(metrics['best_trade'], 2),
+                    'worst_trade': round(metrics['worst_trade'], 2),
                     'execution_time': round(result['execution_time'], 3)
                 }
 
@@ -1013,7 +1132,7 @@ class UltraFastOptimizer:
     def _print_top_results(self, results: List[Dict], top_n: int = 10):
         """Виведення топ результатів"""
         logging.warning(f"\n{'=' * 80}")
-        logging.warning(f"ТОП-{top_n} НАЙКРАЩИХ КОНФІГУРАЦІЙ")
+        logging.warning(f"ТОП-{top_n} НАЙКРАЩИХ КОНФІГУРАЦІЙ З ФІЛЬТРАЦІЄЮ")
         logging.warning(f"{'=' * 80}")
 
         for i, result in enumerate(results[:top_n], 1):
@@ -1022,36 +1141,42 @@ class UltraFastOptimizer:
 
             logging.warning(f"\n#{i} - {result['config_id']}")
             logging.warning(f"Угод: {metrics['total_trades']} | "
-                            f"Win Rate: {metrics['win_rate']:.1f}% | "
-                            f"Avg PnL: {metrics['avg_pnl']:.3f}%")
-            logging.warning(f"Total PnL: {metrics['total_pnl']:.2f}% | "
-                            f"Profit Factor: {metrics['profit_factor']:.2f} | "
-                            f"Max DD: {metrics['max_drawdown']:.2f}%")
+                            f"Відфільтровано: {metrics['filtered_out']} | "
+                            f"Win Rate: {metrics['win_rate']:.1f}%")
+            logging.warning(f"Avg PnL: {metrics['avg_pnl']:.3f}% | "
+                            f"Total PnL: {metrics['total_pnl']:.2f}% | "
+                            f"Profit Factor: {metrics['profit_factor']:.2f}")
+            logging.warning(f"Max DD: {metrics['max_drawdown']:.2f}% | "
+                            f"Best: {metrics['best_trade']:.2f}% | "
+                            f"Worst: {metrics['worst_trade']:.2f}%")
 
             # Ключові параметри
-            key_params = ['stop_loss', 'take_profit', 'use_trailing_stop', 'long_exit_zone']
+            key_params = ['stop_loss', 'take_profit', 'use_trailing_stop', 'long_exit_zone',
+                          'secondary_timeframes', 'short_enter_zone_mid_tf', 'sma_change_threshold']
             param_str = []
             for param in key_params:
                 if param in params:
                     param_str.append(f"{param}={params[param]}")
 
             if param_str:
-                logging.warning(f"Параметри: {' | '.join(param_str[:4])}")
+                logging.warning(f"Ключові параметри: {' | '.join(param_str[:4])}")
+                if len(param_str) > 4:
+                    logging.warning(f"Додаткові: {' | '.join(param_str[4:7])}")
 
 
 # Головна функція для запуску
 async def main():
     """Головна функція запуску оптимізатора"""
-    parser = argparse.ArgumentParser(description='Ультра-швидкий оптимізатор Enhanced Analyzer')
+    parser = argparse.ArgumentParser(description='Ультра-швидкий оптимізатор Enhanced Analyzer з фільтрацією')
     parser.add_argument('input_csv', help='CSV файл з сигналами')
     parser.add_argument('-c', '--config', default='updated_analyzer_config.json',
                         help='Базовий конфіг файл')
     parser.add_argument('-n', '--max-configs', type=int, default=500,
                         help='Максимальна кількість конфігурацій')
     parser.add_argument('-m', '--mode', default='ultra_fast',
-                        choices=['ultra_fast', 'balanced'],
+                        choices=['ultra_fast', 'fast', 'balanced'],
                         help='Режим оптимізації')
-    parser.add_argument('-o', '--output', default='ultra_fast_results.csv',
+    parser.add_argument('-o', '--output', default='ultra_fast_filtered_results.csv',
                         help='Файл для результатів')
     parser.add_argument('--concurrent', type=int, default=50,
                         help='Максимальна кількість одночасних завдань')
@@ -1063,7 +1188,7 @@ async def main():
         level=logging.WARNING,
         format='%(asctime)s - %(levelname)s - %(message)s',
         handlers=[
-            logging.FileHandler('ultra_fast_optimizer.log', encoding='utf-8'),
+            logging.FileHandler('ultra_fast_filtered_optimizer.log', encoding='utf-8'),
             logging.StreamHandler()
         ]
     )
@@ -1078,7 +1203,7 @@ async def main():
         max_concurrent=args.concurrent
     )
 
-    logging.warning("Початок ультра-швидкої оптимізації")
+    logging.warning("Початок ультра-швидкої оптимізації з фільтрацією")
     logging.warning(f"CPU cores: {psutil.cpu_count()}")
     logging.warning(f"Доступна RAM: {psutil.virtual_memory().total // (1024 ** 3)} GB")
     logging.warning(f"Concurrent tasks: {args.concurrent}")
@@ -1093,7 +1218,12 @@ async def main():
 
         if results:
             logging.warning("\nОптимізація успішно завершена!")
-            logging.warning(f"Найкращий результат: Avg PnL = {results[0]['metrics']['avg_pnl']:.3f}%")
+            best_metrics = results[0]['metrics']
+            logging.warning(f"Найкращий результат:")
+            logging.warning(f"  - Avg PnL: {best_metrics['avg_pnl']:.3f}%")
+            logging.warning(f"  - Total trades: {best_metrics['total_trades']}")
+            logging.warning(f"  - Filtered out: {best_metrics['filtered_out']}")
+            logging.warning(f"  - Win rate: {best_metrics['win_rate']:.1f}%")
             logging.warning(f"Результати збережено в: {args.output}")
         else:
             logging.error("Оптимізація не дала результатів")
@@ -1106,6 +1236,129 @@ async def main():
         gc.collect()
         final_memory = psutil.virtual_memory().percent
         logging.warning(f"Використання пам'яті: {final_memory:.1f}%")
+
+
+# Додаткові функції для налагодження та аналізу
+def analyze_filtering_impact(results_file: str) -> Dict:
+    """Аналіз впливу фільтрації на результати"""
+    try:
+        df = pd.read_csv(results_file, delimiter=';')
+
+        analysis = {
+            'total_configs': len(df),
+            'avg_filtered_out': df['filtered_out'].mean() if 'filtered_out' in df.columns else 0,
+            'max_filtered_out': df['filtered_out'].max() if 'filtered_out' in df.columns else 0,
+            'min_filtered_out': df['filtered_out'].min() if 'filtered_out' in df.columns else 0,
+        }
+
+        # Кореляція між фільтрацією та прибутковістю
+        if 'filtered_out' in df.columns and 'avg_pnl' in df.columns:
+            correlation = df['filtered_out'].corr(df['avg_pnl'])
+            analysis['filter_performance_correlation'] = correlation
+
+        return analysis
+
+    except Exception as e:
+        logging.error(f"Помилка аналізу фільтрації: {e}")
+        return {}
+
+
+def save_best_config_with_filtering(results_file: str, output_config_file: str = None):
+    """Збереження найкращої конфігурації з урахуванням фільтрації"""
+    try:
+        df = pd.read_csv(results_file, delimiter=';')
+        if df.empty:
+            logging.error("Файл результатів порожній")
+            return
+
+        best_row = df.iloc[0]  # Перший рядок - найкращий результат
+
+        if output_config_file is None:
+            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+            output_config_file = f'best_filtered_config_{timestamp}.json'
+
+        # Створюємо конфігурацію з параметрів
+        config = {
+            "trading_parameters": {
+                "stop_loss": float(best_row.get('stop_loss', 0.018)),
+                "take_profit": float(best_row.get('take_profit', 0.035)),
+                "max_hold_hours": int(best_row.get('max_hold_hours', 24)),
+                "use_trailing_stop": bool(best_row.get('use_trailing_stop', True)),
+                "trailing_stop_activation": float(best_row.get('trailing_stop_activation', 0.01)),
+                "trailing_stop_distance": float(best_row.get('trailing_stop_distance', 0.008)),
+            },
+            "rsi_parameters": {
+                "rsi_period": 14,
+                "rsi_sma_period": 14,
+                "long_enter_zone": 30,
+                "short_enter_zone": 70,
+                "long_exit_zone": int(best_row.get('long_exit_zone', 65)),
+                "short_exit_zone": int(best_row.get('short_exit_zone', 35)),
+                "long_extreme_exit": int(best_row.get('long_extreme_exit', 80)),
+                "short_extreme_exit": int(best_row.get('short_extreme_exit', 20))
+            },
+            "timeframe_settings": {
+                "primary_timeframe": "5m",
+                "secondary_timeframes": eval(best_row.get('secondary_timeframes', "['15m']"))
+            },
+            "secondary_tf_filter": {
+                "short_enter_zone_mid_tf": int(best_row.get('short_enter_zone_mid_tf', 60)),
+                "long_enter_zone_mid_tf": int(best_row.get('long_enter_zone_mid_tf', 40)),
+                "sma_change_periods": int(best_row.get('sma_change_periods', 5)),
+                "sma_change_threshold": float(best_row.get('sma_change_threshold', 0.5)),
+                "rsi_extreme_threshold": int(best_row.get('rsi_extreme_threshold', 15)),
+                "cross_lookback_periods": int(best_row.get('cross_lookback_periods', 10))
+            },
+            "data_management": {
+                "buffer_hours_before": int(best_row.get('buffer_hours_before', 120)),
+                "buffer_hours_after": int(best_row.get('buffer_hours_after', 240)),
+                "tf_multiplier": {
+                    "5m": 1,
+                    "15m": int(best_row.get('tf_multiplier_15m', 3)),
+                    "30m": int(best_row.get('tf_multiplier_30m', 6)),
+                    "1h": int(best_row.get('tf_multiplier_1h', 12))
+                }
+            },
+            "optimization_metadata": {
+                "config_id": str(best_row.get('config_id', '')),
+                "rank": 1,
+                "performance_metrics": {
+                    "avg_pnl": float(best_row.get('avg_pnl', 0)),
+                    "win_rate": float(best_row.get('win_rate', 0)),
+                    "total_trades": int(best_row.get('total_trades', 0)),
+                    "filtered_out": int(best_row.get('filtered_out', 0)),
+                    "profit_factor": float(best_row.get('profit_factor', 0)),
+                    "max_drawdown": float(best_row.get('max_drawdown', 0))
+                },
+                "optimization_date": datetime.now().isoformat(),
+                "filtering_enabled": True
+            },
+            "exchange": "bybit",
+            "banned_pairs": []
+        }
+
+        with open(output_config_file, 'w', encoding='utf-8') as f:
+            json.dump(config, f, indent=2, ensure_ascii=False)
+
+        logging.warning(f"Найкращу конфігурацію з фільтрацією збережено в: {output_config_file}")
+        logging.warning(f"Метрики: Trades={config['optimization_metadata']['performance_metrics']['total_trades']}, "
+                        f"Filtered={config['optimization_metadata']['performance_metrics']['filtered_out']}, "
+                        f"AvgPnL={config['optimization_metadata']['performance_metrics']['avg_pnl']:.3f}%")
+
+        return output_config_file
+
+    except Exception as e:
+        logging.error(f"Помилка збереження конфігурації: {e}")
+        return None
+
+
+def compare_with_without_filtering(input_csv: str, config_file: str = None):
+    """Порівняння результатів з фільтрацією та без неї"""
+    logging.warning("Запуск порівняльного аналізу фільтрації...")
+
+    # Цю функцію можна розширити для запуску двох версій оптимізатора
+    # та порівняння їх результатів
+    pass
 
 
 if __name__ == "__main__":
